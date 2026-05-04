@@ -25,22 +25,27 @@ jobs:
           echo "==== [DOWNLOAD START] ===="
           URL="${{ github.event.inputs.model_url }}"
           
-          # 1. 提取原始文件名并剔除 URL 参数
-          RAW_NAME=$(basename "${URL%%?*}")
+          # 1. 修复 BUG：使用 \? 精准剥离 URL 后的下载参数
+          CLEAN_URL="${URL%%\?*}"
+          RAW_NAME=$(basename "$CLEAN_URL")
           
-          # 2. 彻底剥离 .gguf 后缀 (用于前缀命名)
-          # 这样 Llama.gguf 就会变成 Llama
+          # 2. 防御性编程：如果提取出错了，给个默认名保底
+          if [[ -z "$RAW_NAME" || "$RAW_NAME" == "/" ]]; then
+            RAW_NAME="model.gguf"
+          fi
+          
+          # 3. 彻底剥离 .gguf 后缀 (用于前缀命名)
           BASE_NAME="${RAW_NAME%.*}"
           
           echo "原始完整名: $RAW_NAME"
           echo "纯净前缀名: $BASE_NAME"
           
-          # 存入环境变量
+          # 存入环境变量 (供后续 Step 使用)
           echo "RAW_NAME=$RAW_NAME" >> $GITHUB_ENV
           echo "BASE_NAME=$BASE_NAME" >> $GITHUB_ENV
           echo "CST_TIME=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
           
-          # 3. 开始并行下载
+          # 4. 开始并行下载，精准指定保存文件名
           aria2c -x 16 -s 16 -k 1M --console-log-level=notice --file-allocation=none \
           "$URL" -o "$RAW_NAME"
           
@@ -49,8 +54,9 @@ jobs:
       - name: 🔪 [3/4] 极限切割 (2GB-1B)
         run: |
           echo "==== [SPLIT START] ===="
-          RAW="${{ env.RAW_NAME }}"
-          BASE="${{ env.BASE_NAME }}"
+          # 直接使用环境变量 (GitHub 会自动注入 $GITHUB_ENV)
+          RAW="$RAW_NAME"
+          BASE="$BASE_NAME"
           CHUNK_BYTES=2147483647
           
           FILE_SIZE=$(stat -c%s "$RAW")
@@ -59,27 +65,25 @@ jobs:
           
           echo "执行切割: $RAW -> ${BASE}-XXXXX-of-${TOTAL_PAD}.gguf"
           
-          # 核心改动：前缀用 BASE，后缀用 .gguf
+          # 前缀用 BASE，后缀用 .gguf
           split -b $CHUNK_BYTES -d -a 5 --numeric-suffixes=1 \
                 --additional-suffix="-of-$TOTAL_PAD.gguf" \
                 "$RAW" "$BASE-"
           
           rm "$RAW"
-          echo "✅ 切割完成。分段示例: $(ls model-* 2>/dev/null | head -n 1 || ls ${BASE}-* | head -n 1)"
+          echo "✅ 切割完成。分段清单："
           ls -lh "${BASE}-"*
 
       - name: 🚢 [4/4] 智能命名上传 (6 并发 + 独立重试)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          RAW_NAME: ${{ env.RAW_NAME }}
-          BASE_NAME: ${{ env.BASE_NAME }}
-          CST_TIME: ${{ env.CST_TIME }}
         run: |
           echo "==== [UPLOAD START] ===="
           
           # Release 标签：纯净文件名 + 时间
           TAG="${BASE_NAME}-${CST_TIME}"
+          echo "即将发布到 Tag: $TAG"
           
           gh release create "$TAG" --repo "$REPO" \
             --title "Relay: $BASE_NAME ($CST_TIME)" \
