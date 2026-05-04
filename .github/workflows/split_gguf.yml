@@ -1,4 +1,4 @@
-name: "🚀 GGUF Extreme Pro: Dynamic Naming & TZ-CST"
+name: "🚀 GGUF Extreme Pro: Perfect Naming"
 
 on:
   workflow_dispatch:
@@ -17,111 +17,99 @@ jobs:
       - name: 📊 [1/4] 环境检查与工具安装
         run: |
           echo "==== [SYSTEM INFO] ===="
-          echo "处理器: $(nproc) 核 | 内存: $(free -h | awk '/^Mem:/ {print $2}')"
           sudo apt-get update -qq && sudo apt-get install -y -qq aria2
           echo "✅ 工具安装完成。"
 
-      - name: ⚡ [2/4] 动态命名与多线程下载
-        id: download_step
+      - name: ⚡ [2/4] 智能提取名称与多线程下载
         run: |
           echo "==== [DOWNLOAD START] ===="
           URL="${{ github.event.inputs.model_url }}"
           
-          # 1. 动态提取文件名 (去除 URL 参数)
-          FILE_NAME=$(basename "${URL%%?*}")
-          if [[ -z "$FILE_NAME" ]]; then FILE_NAME="model.gguf"; fi
-          echo "目标文件名: $FILE_NAME"
-          echo "TARGET_FILENAME=$FILE_NAME" >> $GITHUB_ENV
+          # 1. 提取原始文件名并剔除 URL 参数
+          RAW_NAME=$(basename "${URL%%?*}")
           
-          # 2. 获取东八区时间 (CST)
-          # TZ='Asia/Shanghai' 在 Ubuntu 环境下直接生效
-          CST_TIME=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M')
-          echo "当前东八区时间: $CST_TIME"
-          echo "CST_TIME=$CST_TIME" >> $GITHUB_ENV
+          # 2. 彻底剥离 .gguf 后缀 (用于前缀命名)
+          # 这样 Llama.gguf 就会变成 Llama
+          BASE_NAME="${RAW_NAME%.*}"
+          
+          echo "原始完整名: $RAW_NAME"
+          echo "纯净前缀名: $BASE_NAME"
+          
+          # 存入环境变量
+          echo "RAW_NAME=$RAW_NAME" >> $GITHUB_ENV
+          echo "BASE_NAME=$BASE_NAME" >> $GITHUB_ENV
+          echo "CST_TIME=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
           
           # 3. 开始并行下载
           aria2c -x 16 -s 16 -k 1M --console-log-level=notice --file-allocation=none \
-          "$URL" -o "$FILE_NAME"
+          "$URL" -o "$RAW_NAME"
           
-          echo -e "\n✅ 下载完成: $(ls -lh "$FILE_NAME")"
+          echo -e "\n✅ 下载完成: $(ls -lh "$RAW_NAME")"
 
       - name: 🔪 [3/4] 极限切割 (2GB-1B)
         run: |
           echo "==== [SPLIT START] ===="
-          # 使用环境变量中存储的文件名
-          RAW="${{ env.TARGET_FILENAME }}"
+          RAW="${{ env.RAW_NAME }}"
+          BASE="${{ env.BASE_NAME }}"
           CHUNK_BYTES=2147483647
           
           FILE_SIZE=$(stat -c%s "$RAW")
           TOTAL=$(( (FILE_SIZE + CHUNK_BYTES - 1) / CHUNK_BYTES ))
           TOTAL_PAD=$(printf "%05d" $TOTAL)
           
-          echo "文件大小: $FILE_SIZE 字节 | 预计分段: $TOTAL"
+          echo "执行切割: $RAW -> ${BASE}-XXXXX-of-${TOTAL_PAD}.gguf"
           
-          # 使用目标文件名作为前缀进行切割
-          # 输出示例: Llama-3-8B.gguf-00001-of-00003.gguf
+          # 核心改动：前缀用 BASE，后缀用 .gguf
           split -b $CHUNK_BYTES -d -a 5 --numeric-suffixes=1 \
                 --additional-suffix="-of-$TOTAL_PAD.gguf" \
-                "$RAW" "$RAW-"
+                "$RAW" "$BASE-"
           
           rm "$RAW"
-          echo "✅ 切割完成。前缀使用: $RAW-"
-          ls -lh "$RAW-"*
+          echo "✅ 切割完成。分段示例: $(ls model-* 2>/dev/null | head -n 1 || ls ${BASE}-* | head -n 1)"
+          ls -lh "${BASE}-"*
 
       - name: 🚢 [4/4] 智能命名上传 (6 并发 + 独立重试)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TARGET_FILENAME: ${{ env.TARGET_FILENAME }}
+          RAW_NAME: ${{ env.RAW_NAME }}
+          BASE_NAME: ${{ env.BASE_NAME }}
           CST_TIME: ${{ env.CST_TIME }}
         run: |
           echo "==== [UPLOAD START] ===="
           
-          # 标签命名: 目标文件名 + 东八区时间
-          TAG="${TARGET_FILENAME}-${CST_TIME}"
-          echo "Release Tag: $TAG"
+          # Release 标签：纯净文件名 + 时间
+          TAG="${BASE_NAME}-${CST_TIME}"
           
           gh release create "$TAG" --repo "$REPO" \
-            --title "Relay: $TARGET_FILENAME ($CST_TIME)" \
-            --notes "Original Source: ${{ github.event.inputs.model_url }}"
+            --title "Relay: $BASE_NAME ($CST_TIME)" \
+            --notes "Source: ${{ github.event.inputs.model_url }}"
 
-          # 并发上传核心函数
           upload_with_retry() {
             local file=$1
             local tag=$2
             local repo=$3
             local attempt=1
-            local max_retries=5
-            
-            while [ $attempt -le $max_retries ]; do
-              echo "▶️ [$file] 尝试上传 $attempt/$max_retries"
-              # 使用 --clobber 防止残余干扰
+            while [ $attempt -le 5 ]; do
+              echo "▶️ [$file] 尝试 $attempt/5"
               if gh release upload "$tag" "$file" --repo "$repo" --clobber; then
-                echo "✅ [$file] 上传完成"
+                echo "✅ [$file] 成功"
                 return 0
-              else
-                echo "⚠️ [$file] 失败，$((attempt * 5))秒后重试..."
-                sleep $((attempt * 5))
-                attempt=$((attempt + 1))
               fi
+              sleep $((attempt * 5))
+              attempt=$((attempt + 1))
             done
             return 1
           }
-
           export -f upload_with_retry
           
-          # 控制并发数为 6
+          # 并发处理
           MAX_JOBS=6
-          for f in "$TARGET_FILENAME-"*; do
+          for f in "${BASE_NAME}-"*; do
             upload_with_retry "$f" "$TAG" "$REPO" &
-            
-            # 流量控制：如果后台任务达到阈值，等待其中一个完成
-            if [[ $(jobs -r | wc -l) -ge $MAX_JOBS ]]; then
-              wait -n
-            fi
+            if [[ $(jobs -r | wc -l) -ge $MAX_JOBS ]]; then wait -n; fi
           done
 
-          # 等待所有上传任务结束
           wait
-          echo -e "\n==== [🎉 全部流程圆满完成] ===="
-          echo "访问地址: https://github.com/$REPO/releases/tag/$TAG"
+          echo -e "\n==== [🎉 中转完成] ===="
+          echo "链接: https://github.com/$REPO/releases/tag/$TAG"
