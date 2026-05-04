@@ -1,4 +1,4 @@
-name: "🚀 GGUF Extreme Manual Parallel Relay"
+name: "🚀 GGUF Extreme Pro: Dynamic Naming & TZ-CST"
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
 
 jobs:
-  parallel-relay:
+  pro-relay:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -18,81 +18,110 @@ jobs:
         run: |
           echo "==== [SYSTEM INFO] ===="
           echo "处理器: $(nproc) 核 | 内存: $(free -h | awk '/^Mem:/ {print $2}')"
-          echo "可用磁盘空间:"
-          df -h / | grep /
           sudo apt-get update -qq && sudo apt-get install -y -qq aria2
           echo "✅ 工具安装完成。"
 
-      - name: ⚡ [2/4] 多线程断点续传下载
+      - name: ⚡ [2/4] 动态命名与多线程下载
+        id: download_step
         run: |
           echo "==== [DOWNLOAD START] ===="
+          URL="${{ github.event.inputs.model_url }}"
+          
+          # 1. 动态提取文件名 (去除 URL 参数)
+          FILE_NAME=$(basename "${URL%%?*}")
+          if [[ -z "$FILE_NAME" ]]; then FILE_NAME="model.gguf"; fi
+          echo "目标文件名: $FILE_NAME"
+          echo "TARGET_FILENAME=$FILE_NAME" >> $GITHUB_ENV
+          
+          # 2. 获取东八区时间 (CST)
+          # TZ='Asia/Shanghai' 在 Ubuntu 环境下直接生效
+          CST_TIME=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M')
+          echo "当前东八区时间: $CST_TIME"
+          echo "CST_TIME=$CST_TIME" >> $GITHUB_ENV
+          
+          # 3. 开始并行下载
           aria2c -x 16 -s 16 -k 1M --console-log-level=notice --file-allocation=none \
-          "${{ github.event.inputs.model_url }}" -o "raw.gguf"
-          echo -e "\n✅ 下载完成: $(ls -lh raw.gguf)"
+          "$URL" -o "$FILE_NAME"
+          
+          echo -e "\n✅ 下载完成: $(ls -lh "$FILE_NAME")"
 
       - name: 🔪 [3/4] 极限切割 (2GB-1B)
         run: |
           echo "==== [SPLIT START] ===="
-          RAW="raw.gguf"
+          # 使用环境变量中存储的文件名
+          RAW="${{ env.TARGET_FILENAME }}"
           CHUNK_BYTES=2147483647
+          
           FILE_SIZE=$(stat -c%s "$RAW")
           TOTAL=$(( (FILE_SIZE + CHUNK_BYTES - 1) / CHUNK_BYTES ))
           TOTAL_PAD=$(printf "%05d" $TOTAL)
           
+          echo "文件大小: $FILE_SIZE 字节 | 预计分段: $TOTAL"
+          
+          # 使用目标文件名作为前缀进行切割
+          # 输出示例: Llama-3-8B.gguf-00001-of-00003.gguf
           split -b $CHUNK_BYTES -d -a 5 --numeric-suffixes=1 \
                 --additional-suffix="-of-$TOTAL_PAD.gguf" \
-                "$RAW" "model-"
+                "$RAW" "$RAW-"
+          
           rm "$RAW"
-          echo "✅ 已切割为 $TOTAL 个分段。"
-          ls -lh model-*.gguf
+          echo "✅ 切割完成。前缀使用: $RAW-"
+          ls -lh "$RAW-"*
 
-      - name: 🚢 [4/4] 手动并发上传 (6 线程 + 独立重试)
+      - name: 🚢 [4/4] 智能命名上传 (6 并发 + 独立重试)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          TARGET_FILENAME: ${{ env.TARGET_FILENAME }}
+          CST_TIME: ${{ env.CST_TIME }}
         run: |
           echo "==== [UPLOAD START] ===="
-          TAG="relay-${{ github.run_id }}"
-          gh release create "$TAG" --repo "$REPO" --title "Relay: $(date +'%H:%M')" --notes "Source: ${{ github.event.inputs.model_url }}"
+          
+          # 标签命名: 目标文件名 + 东八区时间
+          TAG="${TARGET_FILENAME}-${CST_TIME}"
+          echo "Release Tag: $TAG"
+          
+          gh release create "$TAG" --repo "$REPO" \
+            --title "Relay: $TARGET_FILENAME ($CST_TIME)" \
+            --notes "Original Source: ${{ github.event.inputs.model_url }}"
 
-          # 并发上传函数
+          # 并发上传核心函数
           upload_with_retry() {
             local file=$1
+            local tag=$2
+            local repo=$3
             local attempt=1
             local max_retries=5
             
             while [ $attempt -le $max_retries ]; do
-              echo "▶️ [File: $file] 尝试上传 $attempt/$max_retries"
-              if gh release upload "$TAG" "$file" --repo "$REPO" --clobber; then
-                echo "✅ [File: $file] 上传成功！"
+              echo "▶️ [$file] 尝试上传 $attempt/$max_retries"
+              # 使用 --clobber 防止残余干扰
+              if gh release upload "$tag" "$file" --repo "$repo" --clobber; then
+                echo "✅ [$file] 上传完成"
                 return 0
               else
-                echo "⚠️ [File: $file] 失败，等待重试..."
+                echo "⚠️ [$file] 失败，$((attempt * 5))秒后重试..."
                 sleep $((attempt * 5))
                 attempt=$((attempt + 1))
               fi
             done
-            echo "🚨 [File: $file] 最终上传失败！"
             return 1
           }
 
           export -f upload_with_retry
           
-          # 手动控制并发：最多同时运行 6 个后台任务
+          # 控制并发数为 6
           MAX_JOBS=6
-          COUNT=0
-          
-          for f in model-*.gguf; do
-            # 运行上传并放入后台
-            upload_with_retry "$f" &
-            COUNT=$((COUNT + 1))
+          for f in "$TARGET_FILENAME-"*; do
+            upload_with_retry "$f" "$TAG" "$REPO" &
             
-            # 当后台任务数达到 MAX_JOBS 时，等待其中一个完成
+            # 流量控制：如果后台任务达到阈值，等待其中一个完成
             if [[ $(jobs -r | wc -l) -ge $MAX_JOBS ]]; then
               wait -n
             fi
           done
 
-          # 等待所有剩余后台任务完成
+          # 等待所有上传任务结束
           wait
-          echo "==== [ALL PROCESSES FINISHED] ===="
+          echo -e "\n==== [🎉 全部流程圆满完成] ===="
+          echo "访问地址: https://github.com/$REPO/releases/tag/$TAG"
