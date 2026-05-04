@@ -40,9 +40,16 @@ jobs:
       - name: Reliable Upload
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 提前定义变量，减少后面命令的复杂度
+          REPO: ${{ github.repository }}
         run: |
           TAG="relay-${{ github.run_id }}"
-          gh release create "$TAG" --title "Relay: $(date +'%Y-%m-%d')" --notes "Source: ${{ github.event.inputs.model_url }}"
+          
+          # 显式指定 --repo，这样就不需要 git init 或 checkout
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "Relay: $(date +'%Y-%m-%d')" \
+            --notes "Source: ${{ github.event.inputs.model_url }}"
           
           MAX_RETRIES=5
           ATTEMPT=1
@@ -50,7 +57,8 @@ jobs:
           
           while [ $ATTEMPT -le $MAX_RETRIES ]; do
             echo "Attempt $ATTEMPT..."
-            if gh release upload "$TAG" model-*.gguf --clobber; then
+            # 同样在上传时显式指定 --repo
+            if gh release upload "$TAG" model-*.gguf --repo "$REPO" --clobber; then
               echo "Upload Success"
               SUCCESS=true
               break
@@ -62,5 +70,6 @@ jobs:
           done
           
           if [ "$SUCCESS" = false ]; then
+            echo "Final attempt failed."
             exit 1
           fi
