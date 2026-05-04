@@ -1,0 +1,83 @@
+name: "🚀 GGUF Extreme Relay (Max Size + Retry)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: '输入无法直连的 GGUF 链接'
+        required: true
+
+jobs:
+  extreme-relay:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 🛠️ 极速安装 Aria2
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq aria2
+
+      - name: ⚡ 满血并行下载
+        run: |
+          aria2c -x 16 -s 16 -k 1M --console-log-level=warn --file-allocation=none \
+          "${{ github.event.inputs.model_url }}" -o "raw.gguf"
+
+      - name: 🔪 极限切割 (2GB - 1 Byte)
+        run: |
+          RAW="raw.gguf"
+          # 2GB 物理极限为 2147483648 字节，这里设定为 2147483647 字节 (-1 Byte)
+          CHUNK_BYTES=2147483647
+          
+          FILE_SIZE=$(stat -c%s "$RAW")
+          TOTAL=$(( (FILE_SIZE + CHUNK_BYTES - 1) / CHUNK_BYTES ))
+          TOTAL_PAD=$(printf "%05d" $TOTAL)
+          
+          echo "执行极限切割：每个分块 $CHUNK_BYTES 字节"
+          
+          # 直接进行字节级切割，保留 HF 友好命名格式
+          split -b $CHUNK_BYTES -d -a 5 --numeric-suffixes=1 \
+                --additional-suffix="-of-$TOTAL_PAD.gguf" \
+                "$RAW" "model-"
+          
+          # 秒删原文件，暴力释放磁盘空间
+          rm "$RAW"
+
+      - name: 🚢 暴力上传 (含 5 次指数重试机制)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="relay-${{ github.run_id }}"
+          # 创建 Release
+          gh release create "$TAG" --title "Extreme Relay: $(date +'%m-%d %H:%M')" --notes "Source: ${{ github.event.inputs.model_url }}"
+          
+          # 重试逻辑配置
+          MAX_RETRIES=5
+          ATTEMPT=1
+          SUCCESS=false
+          
+          # 循环重试上传
+          while [ $ATTEMPT -le $MAX_RETRIES ]; do
+            echo "▶️ 开始上传尝试 $ATTEMPT / $MAX_RETRIES ..."
+            
+            # --clobber: 允许覆盖，防止上一次传了一半的残缺文件导致报错
+            if gh release upload "$TAG" model-*.gguf --clobber; then
+              echo "✅ 上传成功！"
+              SUCCESS=true
+              break
+            else
+              echo "⚠️ 上传中断或失败。"
+              if [ $ATTEMPT -lt $MAX_RETRIES ]; then
+                WAIT_TIME=$(( ATTEMPT * 5 )) # 递增等待时间: 5s, 10s, 15s...
+                echo "⏳ 等待 $WAIT_TIME 秒后重试..."
+                sleep $WAIT_TIME
+              fi
+              ATTEMPT=$((ATTEMPT + 1))
+            fi
+          done
+          
+          # 如果超过次数仍失败，强制中断 Action 并报错
+          if [ "$SUCCESS" = false ]; then
+            echo "🚨 超过最大重试次数 ($MAX_RETRIES)，上传最终失败！"
+            exit 1
+          fi
+
