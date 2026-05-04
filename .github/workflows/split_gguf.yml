@@ -1,75 +1,118 @@
-name: GGUF-Extreme-Relay
+name: "🚀 GGUF Extreme Monitor & Parallel Relay"
 
 on:
   workflow_dispatch:
     inputs:
       model_url:
-        description: 'Target GGUF URL'
+        description: '目标 GGUF 下载地址'
         required: true
 
 jobs:
-  extreme-relay:
+  parallel-relay:
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Install Tools
+      - name: 📊 [1/4] 环境检查与工具安装
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2
+          echo "==== [SYSTEM INFO] ===="
+          date
+          echo "操作系统: $(lsb_release -ds)"
+          echo "处理器核数: $(nproc)"
+          echo "可用磁盘空间 (起始):"
+          df -h / | grep /
+          
+          echo -e "\n正在极速安装 Aria2..."
+          sudo apt-get update -qq && sudo apt-get install -y -qq aria2
+          echo "✅ 工具安装完成。"
 
-      - name: High-Speed Download
+      - name: ⚡ [2/4] 多线程断点续传下载
         run: |
-          aria2c -x 16 -s 16 -k 1M --console-log-level=warn --file-allocation=none \
+          echo "==== [DOWNLOAD START] ===="
+          START_TIME=$(date +%s)
+          
+          # 使用 aria2c 强力拉取
+          aria2c -x 16 -s 16 -k 1M --console-log-level=notice --file-allocation=none \
           "${{ github.event.inputs.model_url }}" -o "raw.gguf"
+          
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          echo -e "\n✅ 下载完成！"
+          echo "耗时: ${DURATION} 秒"
+          echo "文件详情: $(ls -lh raw.gguf)"
+          echo "可用磁盘空间 (下载后):"
+          df -h / | grep /
 
-      - name: Max-Size Split
+      - name: 🔪 [3/4] 极限切割 (2GB-1B) 与 命名对齐
         run: |
+          echo "==== [SPLIT START] ===="
           RAW="raw.gguf"
-          CHUNK_BYTES=2147483647
+          CHUNK_BYTES=2147483647 # 极限 2GB - 1 字节
+          
           FILE_SIZE=$(stat -c%s "$RAW")
           TOTAL=$(( (FILE_SIZE + CHUNK_BYTES - 1) / CHUNK_BYTES ))
           TOTAL_PAD=$(printf "%05d" $TOTAL)
           
+          echo "原始文件大小: $FILE_SIZE 字节"
+          echo "目标分段数量: $TOTAL"
+          echo "分段规则: $CHUNK_BYTES 字节/分段"
+          
           split -b $CHUNK_BYTES -d -a 5 --numeric-suffixes=1 \
                 --additional-suffix="-of-$TOTAL_PAD.gguf" \
                 "$RAW" "model-"
+          
+          echo "✅ 切割完成。清理原始大文件..."
           rm "$RAW"
+          
+          echo "分段清单:"
+          ls -lh model-*.gguf
+          echo "可用磁盘空间 (切割后):"
+          df -h / | grep /
 
-      - name: Reliable Upload
+      - name: 🚢 [4/4] 极速并行上传 (并发重试模式)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 提前定义变量，减少后面命令的复杂度
           REPO: ${{ github.repository }}
         run: |
+          echo "==== [UPLOAD START] ===="
           TAG="relay-${{ github.run_id }}"
           
-          # 显式指定 --repo，这样就不需要 git init 或 checkout
-          gh release create "$TAG" \
-            --repo "$REPO" \
-            --title "Relay: $(date +'%Y-%m-%d')" \
-            --notes "Source: ${{ github.event.inputs.model_url }}"
+          echo "正在创建 Release: $TAG ..."
+          gh release create "$TAG" --repo "$REPO" \
+            --title "Extreme-Relay: $(date +'%Y%m%d-%H%M')" \
+            --notes "Original URL: ${{ github.event.inputs.model_url }}"
           
           MAX_RETRIES=5
           ATTEMPT=1
           SUCCESS=false
           
+          # 2026 gh CLI 并发参数：--parallel (建议 4-8，兼顾稳定与带宽)
+          PARALLEL_COUNT=6
+          
           while [ $ATTEMPT -le $MAX_RETRIES ]; do
-            echo "Attempt $ATTEMPT..."
-            # 同样在上传时显式指定 --repo
-            if gh release upload "$TAG" model-*.gguf --repo "$REPO" --clobber; then
-              echo "Upload Success"
+            echo "▶️ [尝试 $ATTEMPT/$MAX_RETRIES] 正在以 $PARALLEL_COUNT 并发上传分段文件..."
+            
+            # 使用 --parallel 开启同时上传，--clobber 覆盖失败残余
+            if gh release upload "$TAG" model-*.gguf --repo "$REPO" --clobber --parallel $PARALLEL_COUNT; then
+              echo "✅ [SUCCESS] 所有分段已成功上传至 Release！"
               SUCCESS=true
               break
             else
-              echo "Upload failed, retrying in $((ATTEMPT * 5))s..."
-              sleep $((ATTEMPT * 5))
+              echo "⚠️ [WARNING] 上传部分失败或中断。"
+              if [ $ATTEMPT -lt $MAX_RETRIES ]; then
+                SLEEP_TIME=$((ATTEMPT * 10))
+                echo "⏳ 正在等待 ${SLEEP_TIME}秒 后发起下一次尝试..."
+                sleep $SLEEP_TIME
+              fi
               ATTEMPT=$((ATTEMPT + 1))
             fi
           done
           
           if [ "$SUCCESS" = false ]; then
-            echo "Final attempt failed."
+            echo "🚨 [ERROR] 最终上传失败，请检查网络或 GitHub 状态。"
             exit 1
           fi
+          
+          echo "==== [ALL DONE] ===="
+          echo "Release 地址: https://github.com/$REPO/releases/tag/$TAG"
