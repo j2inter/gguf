@@ -1,22 +1,22 @@
-name: "🚀 Universal Extreme Pro: GGUF & 7z Relay V2"
+name: "🚀 Universal Extreme Pro: GGUF & 7z Relay"
 
 on:
   workflow_dispatch:
     inputs:
       model_url:
-        description: '目标大文件下载地址'
+        description: '目標大文件下載地址'
         required: true
       file_type:
-        description: '文件类型与切割策略'
+        description: '文件類型與切割策略'
         required: true
         type: choice
         options:
-          - gguf   # 使用 split 进行 GGUF 规范化后缀切割
-          - other  # 使用 7z 仅存储模式分卷
-      split_size_mb:
-        description: '最大分卷大小 (单位: MB)'
+          - gguf   # 使用 split 進行 GGUF 規範化後綴切割
+          - other  # 使用 7z 僅存儲模式分卷
+      chunk_size_mb:
+        description: '分卷大小(MB) [最高自動限制為2047]'
         required: true
-        default: '2000' # 默认 2000MB (约2GB)
+        default: '2000'
 
 jobs:
   universal-relay:
@@ -25,93 +25,158 @@ jobs:
       contents: write
 
     steps:
-      - name: 🧹 [1/5] 极限清理磁盘空间 (释放 20GB+ 空间)
+      - name: 🖥️ [1/9] 初始硬件環境與內核深度掃描
+        run: |
+          echo "==== [SYSTEM INFO START] ===="
+          echo "🐧 操作系統內核: $(uname -a)"
+          echo "🧠 CPU 核心數: $(nproc) 核心"
+          echo "💡 CPU 型號:"
+          lscpu | grep "Model name" | sed 's/^[ \t]*//'
+          
+          echo -e "\n📊 初始物理內存狀態:"
+          free -h
+          
+          echo -e "\n💽 初始硬盤分區狀態:"
+          df -Th
+          echo "==== [SYSTEM INFO END] ===="
+
+      - name: 🔍 [2/9] 物理空間嗅探與動態裁決
+        id: precheck
+        run: |
+          echo -e "\n[📈 實時資源監控] 內存可用: $(free -m | awk 'NR==2{printf "%.2f GB", $7/1024}') | 磁盤可用: $(df -h . | awk 'NR==2 {print $4}')\n"
+          
+          echo "==== [SPACE PRE-CHECK] ===="
+          URL="${{ github.event.inputs.model_url }}"
+          
+          FREE_SPACE_MB=$(df -m . | awk 'NR==2 {print $4}')
+          SIZE=$(curl -sIL "$URL" | grep -i -E "^Content-Length:" | tail -n 1 | awk '{print $2}' | tr -d '\r')
+          
+          if [ -z "$SIZE" ] || ! [[ "$SIZE" =~ ^[0-9]+$ ]]; then
+            echo "⚠️ [警告] 無法精確獲取遠端文件大小，強制觸發磁盤清理策略！"
+            echo "need_clean=true" >> $GITHUB_OUTPUT
+          else
+            SIZE_MB=$((SIZE / 1024 / 1024))
+            echo "📦 遠端文件預估體積: ${SIZE_MB} MB"
+            REQUIRED_MB=$(( SIZE_MB * 2 + 1024 ))
+            echo "📈 預估切割峰值空間需求: ${REQUIRED_MB} MB (文件×2 + 1GB緩衝)"
+            
+            if [ "$REQUIRED_MB" -gt "$FREE_SPACE_MB" ]; then
+              echo "🚨 [裁決] 需求 $REQUIRED_MB MB > 可用 $FREE_SPACE_MB MB，觸發深度清理！"
+              echo "need_clean=true" >> $GITHUB_OUTPUT
+            else
+              echo "✅ [裁決] 空間充裕，跳過耗時清理！"
+              echo "need_clean=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: 🧹 [3/9] 動態釋放磁盤空間 (按需執行)
+        if: steps.precheck.outputs.need_clean == 'true'
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
           android: true
           dotnet: true
           haskell: true
-          large-packages: true
-          docker-images: true
+          large-packages: false
+          docker-images: false
           swap-storage: false
 
-      - name: 📊 [2/5] 环境检查与工具安装
+      - name: 🛠️ [4/9] 系統依賴與工具鏈編譯安裝
         run: |
-          echo "==== [SYSTEM INFO] ===="
-          sudo apt-get update -qq && sudo apt-get install -y -qq aria2 p7zip-full
-          echo "✅ 工具安装完成 (aria2, p7zip)。"
-          # 打印当前可用空间
-          df -h /
+          echo -e "\n[📈 實時資源監控] 內存可用: $(free -m | awk 'NR==2{printf "%.2f GB", $7/1024}') | 磁盤可用: $(df -h . | awk 'NR==2 {print $4}')\n"
+          
+          echo "==== [INSTALLING DEPENDENCIES] ===="
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 p7zip-full
+          echo "✅ Aria2 (下載引擎) & p7zip-full (壓縮引擎) 部署完畢。"
 
-      - name: ⚡ [3/5] 智能提取名称与多线程下载
+      - name: 🌐 [5/9] 遠端鏈接解析與元數據註入
         run: |
-          echo "==== [DOWNLOAD START] ===="
+          echo -e "\n[📈 實時資源監控] 內存可用: $(free -m | awk 'NR==2{printf "%.2f GB", $7/1024}') | 磁盤可用: $(df -h . | awk 'NR==2 {print $4}')\n"
+          
+          echo "==== [METADATA PARSING] ===="
           URL="${{ github.event.inputs.model_url }}"
-          
-          # 【修复】转义 \? 防止通配符吞噬整个字符串
           RAW_NAME=$(basename "${URL%%\?*}")
-          
-          # 【修复】兜底机制，防止极端 URL 解析为空
           if [ -z "$RAW_NAME" ] || [ "$RAW_NAME" = "/" ]; then
-            RAW_NAME="download_$(date +%s).bin"
+            RAW_NAME="downloaded_payload_$(date +%s).bin"
+            echo "⚠️ [警告] 無法從 URL 提取有效文件名，已降級為隨機命名: $RAW_NAME"
           fi
           
           BASE_NAME="${RAW_NAME%.*}"
+          SAFE_BASE_NAME="${BASE_NAME// /-}"
           
-          echo "原始完整名: $RAW_NAME"
-          echo "纯净前缀名: $BASE_NAME"
+          echo "📄 原始解析名: $RAW_NAME"
+          echo "📄 安全前綴名: $SAFE_BASE_NAME"
           
-          # 【修复】使用 EOF 多行安全注入，防止特殊字符破坏 ENV
           echo "RAW_NAME<<EOF" >> $GITHUB_ENV
           echo "$RAW_NAME" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           
           echo "BASE_NAME<<EOF" >> $GITHUB_ENV
-          echo "$BASE_NAME" >> $GITHUB_ENV
+          echo "$SAFE_BASE_NAME" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           
           echo "CST_TIME=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
-          
-          aria2c -x 16 -s 16 -k 1M --console-log-level=notice --file-allocation=none \
-          "$URL" -o "$RAW_NAME"
-          
-          echo -e "\n✅ 下载完成:"
-          ls -lh "$RAW_NAME"
+          echo "✅ 環境變量註入成功。"
 
-      - name: 🔪 [4/5] 智能分支切割 (支持自定义MB)
+      - name: ⬇️ [6/9] Aria2 激進並發下載
         run: |
-          echo "==== [SPLIT START] ===="
+          echo -e "\n[📈 實時資源監控] 內存可用: $(free -m | awk 'NR==2{printf "%.2f GB", $7/1024}') | 磁盤可用: $(df -h . | awk 'NR==2 {print $4}')\n"
+          
+          echo "==== [ARIA2 ENGINE START] ===="
+          URL="${{ github.event.inputs.model_url }}"
+          RAW="${{ env.RAW_NAME }}"
+          
+          echo "🚀 啟動 16 線程極限拉取..."
+          aria2c -x 16 -s 16 -k 1M --console-log-level=notice --file-allocation=none "$URL" -o "$RAW"
+          
+          echo -e "\n✅ 下載校驗完成，物理文件狀態:"
+          ls -lh "$RAW"
+
+      - name: 🔪 [7/9] 智能分支切割 (安全上限校驗)
+        run: |
+          echo -e "\n[📈 實時資源監控] 內存可用: $(free -m | awk 'NR==2{printf "%.2f GB", $7/1024}') | 磁盤可用: $(df -h . | awk 'NR==2 {print $4}')\n"
+          
+          echo "==== [SPLIT ENGINE START] ===="
           RAW="${{ env.RAW_NAME }}"
           BASE="${{ env.BASE_NAME }}"
           TYPE="${{ github.event.inputs.file_type }}"
-          SPLIT_MB="${{ github.event.inputs.split_size_mb }}"
+          INPUT_MB="${{ github.event.inputs.chunk_size_mb }}"
+          MAX_BYTES=2147483647
           
-          # 【新增】将输入的 MB 转换为精确字节数进行切割计算
-          CHUNK_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+          if ! [[ "$INPUT_MB" =~ ^[0-9]+$ ]]; then
+            echo "⚠️ [校驗] 輸入值異常，強制回退至最大限制!"
+            CHUNK_BYTES=$MAX_BYTES
+          else
+            USER_BYTES=$((INPUT_MB * 1024 * 1024))
+            if [ "$USER_BYTES" -gt "$MAX_BYTES" ] || [ "$USER_BYTES" -le 0 ]; then
+              echo "⚠️ [校驗] $INPUT_MB MB 越界！強制鎖定為安全閾值: 2GB-1B。"
+              CHUNK_BYTES=$MAX_BYTES
+            else
+              CHUNK_BYTES=$USER_BYTES
+              echo "✅ [校驗] 採用自定義安全分卷大小: $INPUT_MB MB"
+            fi
+          fi
+          
           FILE_SIZE=$(stat -c%s "$RAW")
-          
           TOTAL=$(( (FILE_SIZE + CHUNK_BYTES - 1) / CHUNK_BYTES ))
           TOTAL_PAD=$(printf "%05d" $TOTAL)
           
-          echo "检测到策略: [$TYPE] | 文件大小: $FILE_SIZE 字节 | 预设分卷: $SPLIT_MB MB"
-          
           if [ "$TYPE" = "gguf" ]; then
-            echo "👉 执行 GGUF 标准切割: $RAW -> ${BASE}-XXXXX-of-${TOTAL_PAD}.gguf"
-            split -b $CHUNK_BYTES -d -a 5 --numeric-suffixes=1 \
-                  --additional-suffix="-of-$TOTAL_PAD.gguf" \
-                  "$RAW" "$BASE-"
+            echo "👉 [GGUF 模式] 執行切片: $RAW -> ${BASE}-XXXXX-of-${TOTAL_PAD}.gguf"
+            split -b $CHUNK_BYTES -d -a 5 --numeric-suffixes=1 --additional-suffix="-of-$TOTAL_PAD.gguf" "$RAW" "$BASE-"
           else
-            echo "👉 执行 7z 仅存储分卷: $RAW -> ${BASE}.7z.001"
+            echo "👉 [7z 模式] 執行零壓縮分卷: $RAW -> ${BASE}.7z.001"
             7z a -mx0 -v${CHUNK_BYTES}b "${BASE}.7z" "$RAW"
           fi
           
-          # 切割完成后立刻删除原大文件，释放磁盘空间给后续上传留出余地
+          echo "🧹 切割完畢，立即銷燬母文件以釋放空間..."
           rm -f "$RAW"
-          echo -e "\n✅ 切割完成，产出清单:"
+          
+          echo -e "\n✅ 產物清單:"
           ls -lh "${BASE}"*
 
-      - name: 🚢 [5/5] 智能命名上传 (修复并发捕获与空格Tag)
+      - name: 🚀 [8/9] 併發無損上傳與進程監控
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -119,31 +184,29 @@ jobs:
           CST_TIME: ${{ env.CST_TIME }}
           TYPE: ${{ github.event.inputs.file_type }}
         run: |
-          echo "==== [UPLOAD START] ===="
+          echo -e "\n[📈 實時資源監控] 內存可用: $(free -m | awk 'NR==2{printf "%.2f GB", $7/1024}') | 磁盤可用: $(df -h . | awk 'NR==2 {print $4}')\n"
           
-          # 【修复】将 BASE_NAME 中的空格替换为连字符，防止 Git Tag 创建报错崩溃
-          SAFE_BASE_NAME="${BASE_NAME// /-}"
-          TAG="${SAFE_BASE_NAME}-${CST_TIME}-${TYPE}"
+          echo "==== [UPLOAD ENGINE START] ===="
+          TAG="${BASE_NAME}-${CST_TIME}-${TYPE}"
           
+          echo "🏷️ 創建 Release 標籤: $TAG"
           gh release create "$TAG" --repo "$REPO" \
             --title "Relay [$TYPE]: $BASE_NAME ($CST_TIME)" \
-            --notes "Source: ${{ github.event.inputs.model_url }}
-          Split Size: ${{ github.event.inputs.split_size_mb }} MB"
+            --notes "Source URL: ${{ github.event.inputs.model_url }}"
 
           upload_with_retry() {
-            local file=$1
-            local tag=$2
-            local repo=$3
-            local attempt=1
+            local file=$1; local tag=$2; local repo=$3; local attempt=1
             while [ $attempt -le 5 ]; do
-              echo "▶️ [$file] 尝试 $attempt/5"
+              echo "▶️ [進程 $$] 開始上傳: $file (嘗試 $attempt/5)"
               if gh release upload "$tag" "$file" --repo "$repo" --clobber; then
-                echo "✅ [$file] 成功"
+                echo "✅ [進程 $$] 上傳成功: $file"
                 return 0
               fi
+              echo "⚠️ [進程 $$] 上傳失敗，等待 $((attempt * 5)) 秒後重試..."
               sleep $((attempt * 5))
               attempt=$((attempt + 1))
             done
+            echo "❌ [進程 $$] 致命錯誤: $file 上傳徹底失敗！"
             return 1
           }
           export -f upload_with_retry
@@ -151,20 +214,27 @@ jobs:
           MAX_JOBS=6
           pids=()
           
+          echo "🚢 啟動多進程調度池 (最大併發: $MAX_JOBS)..."
           for f in "${BASE_NAME}"*; do
             upload_with_retry "$f" "$TAG" "$REPO" &
             pids+=($!)
-            
-            # 【修复】使用 wait -n 捕获任意一个后台任务的失败并阻断
             if [[ $(jobs -r | wc -l) -ge $MAX_JOBS ]]; then 
-              wait -n || exit 1
+              wait -n || { echo "❌ 檢測到後臺任務崩潰，觸發熔斷機制！"; exit 1; }
             fi
           done
 
-          # 【修复】等待并捕获收尾任务的退出状态码
+          echo "⏳ 等待所有剩餘子進程收尾..."
           for pid in "${pids[@]}"; do
-            wait $pid || exit 1
+            wait $pid || { echo "❌ 檢測到殘留任務崩潰！"; exit 1; }
           done
           
-          echo -e "\n==== [🎉 中转完成] ===="
-          echo "链接: https://github.com/$REPO/releases/tag/$TAG"
+          echo -e "\n✅ 所有分卷上傳完畢！"
+          echo "URL_TAG=$TAG" >> $GITHUB_ENV
+
+      - name: 🎉 [9/9] 任務竣工報告
+        run: |
+          echo -e "\n[📈 終態資源結算] 內存可用: $(free -m | awk 'NR==2{printf "%.2f GB", $7/1024}') | 磁盤可用: $(df -h . | awk 'NR==2 {print $4}')\n"
+          
+          echo "==== [MISSION ACCOMPLISHED] ===="
+          echo "🔥 極限中轉任務已圓滿結束。"
+          echo "🔗 Release 傳送門: https://github.com/${{ github.repository }}/releases/tag/${{ env.URL_TAG }}"
