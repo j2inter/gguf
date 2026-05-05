@@ -1,0 +1,123 @@
+name: "🚀 Universal Extreme Pro: GGUF & 7z Relay"
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: '目标大文件下载地址'
+        required: true
+      file_type:
+        description: '文件类型与切割策略'
+        required: true
+        type: choice
+        options:
+          - gguf   # 使用 split 进行 GGUF 规范化后缀切割
+          - other  # 使用 7z 仅存储模式分卷 (适合普通大文件)
+
+jobs:
+  universal-relay:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📊 [1/4] 环境检查与工具安装
+        run: |
+          echo "==== [SYSTEM INFO] ===="
+          # 新增安装 p7zip-full 支持 7z 命令
+          sudo apt-get update -qq && sudo apt-get install -y -qq aria2 p7zip-full
+          echo "✅ 工具安装完成 (aria2, p7zip)。"
+
+      - name: ⚡ [2/4] 智能提取名称与多线程下载
+        run: |
+          echo "==== [DOWNLOAD START] ===="
+          URL="${{ github.event.inputs.model_url }}"
+          
+          RAW_NAME=$(basename "${URL%%?*}")
+          BASE_NAME="${RAW_NAME%.*}"
+          
+          echo "原始完整名: $RAW_NAME"
+          echo "纯净前缀名: $BASE_NAME"
+          
+          echo "RAW_NAME=$RAW_NAME" >> $GITHUB_ENV
+          echo "BASE_NAME=$BASE_NAME" >> $GITHUB_ENV
+          echo "CST_TIME=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
+          
+          aria2c -x 16 -s 16 -k 1M --console-log-level=notice --file-allocation=none \
+          "$URL" -o "$RAW_NAME"
+          
+          echo -e "\n✅ 下载完成: $(ls -lh "$RAW_NAME")"
+
+      - name: 🔪 [3/4] 智能分支切割 (2GB-1B)
+        run: |
+          echo "==== [SPLIT START] ===="
+          RAW="${{ env.RAW_NAME }}"
+          BASE="${{ env.BASE_NAME }}"
+          TYPE="${{ github.event.inputs.file_type }}"
+          CHUNK_BYTES=2147483647
+          
+          FILE_SIZE=$(stat -c%s "$RAW")
+          TOTAL=$(( (FILE_SIZE + CHUNK_BYTES - 1) / CHUNK_BYTES ))
+          TOTAL_PAD=$(printf "%05d" $TOTAL)
+          
+          echo "检测到策略: [$TYPE] | 文件大小: $FILE_SIZE 字节"
+          
+          if [ "$TYPE" = "gguf" ]; then
+            echo "👉 执行 GGUF 标准切割: $RAW -> ${BASE}-XXXXX-of-${TOTAL_PAD}.gguf"
+            split -b $CHUNK_BYTES -d -a 5 --numeric-suffixes=1 \
+                  --additional-suffix="-of-$TOTAL_PAD.gguf" \
+                  "$RAW" "$BASE-"
+          else
+            echo "👉 执行 7z 仅存储分卷: $RAW -> ${BASE}.7z.001"
+            # -mx0 表示不压缩（仅存储，速度最快），-v 指定分卷的精确字节数
+            7z a -mx0 -v${CHUNK_BYTES}b "${BASE}.7z" "$RAW"
+          fi
+          
+          rm "$RAW"
+          echo -e "\n✅ 切割完成，产出清单:"
+          ls -lh "${BASE}"*
+
+      - name: 🚢 [4/4] 智能命名上传 (6 并发 + 独立重试)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_NAME: ${{ env.BASE_NAME }}
+          CST_TIME: ${{ env.CST_TIME }}
+          TYPE: ${{ github.event.inputs.file_type }}
+        run: |
+          echo "==== [UPLOAD START] ===="
+          
+          TAG="${BASE_NAME}-${CST_TIME}-${TYPE}"
+          
+          gh release create "$TAG" --repo "$REPO" \
+            --title "Relay [$TYPE]: $BASE_NAME ($CST_TIME)" \
+            --notes "Source: ${{ github.event.inputs.model_url }}"
+
+          upload_with_retry() {
+            local file=$1
+            local tag=$2
+            local repo=$3
+            local attempt=1
+            while [ $attempt -le 5 ]; do
+              echo "▶️ [$file] 尝试 $attempt/5"
+              if gh release upload "$tag" "$file" --repo "$repo" --clobber; then
+                echo "✅ [$file] 成功"
+                return 0
+              fi
+              sleep $((attempt * 5))
+              attempt=$((attempt + 1))
+            done
+            return 1
+          }
+          export -f upload_with_retry
+          
+          MAX_JOBS=6
+          # 自动匹配 ${BASE_NAME}-00001.gguf 或 ${BASE_NAME}.7z.001 等所有前缀一致的文件
+          for f in "${BASE_NAME}"*; do
+            upload_with_retry "$f" "$TAG" "$REPO" &
+            if [[ $(jobs -r | wc -l) -ge $MAX_JOBS ]]; then wait -n; fi
+          done
+
+          wait
+          echo -e "\n==== [🎉 中转完成] ===="
+          echo "链接: https://github.com/$REPO/releases/tag/$TAG"
