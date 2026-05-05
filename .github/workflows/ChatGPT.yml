@@ -1,0 +1,148 @@
+name: Download and Pack
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "选择模式: url 或 pip"
+        required: true
+        default: "url"
+      input_value:
+        description: "URL 或 pip download 命令"
+        required: true
+      compression_level:
+        description: "7z 压缩等级 (0-9)"
+        required: true
+        default: "5"
+      cleanup:
+        description: "是否清理磁盘空间"
+        required: true
+        default: "true"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          choco install 7zip -y
+          choco install gh -y
+
+      - name: Optional Cleanup
+        if: ${{ inputs.cleanup == 'true' }}
+        run: |
+          echo "Cleaning disk..."
+          Remove-Item -Recurse -Force "C:\Program Files\dotnet" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\ghcup" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$env:TEMP\*" -ErrorAction SilentlyContinue
+
+      - name: Prepare workspace
+        run: |
+          mkdir work
+          cd work
+
+      - name: Download
+        shell: powershell
+        run: |
+          cd work
+
+          if ("${{ inputs.mode }}" -eq "url") {
+            $url = "${{ inputs.input_value }}"
+            $filename = Split-Path $url -Leaf
+            Invoke-WebRequest $url -OutFile $filename
+          }
+          else {
+            $cmd = "${{ inputs.input_value }}"
+            Write-Host "Running pip command: $cmd"
+            cmd /c $cmd
+          }
+
+      - name: Process files
+        shell: powershell
+        run: |
+          cd work
+
+          $files = Get-ChildItem
+
+          foreach ($file in $files) {
+            $name = $file.Name
+
+            if ($name -like "*.gguf") {
+              Write-Host "GGUF detected, using split..."
+
+              # 2GB - 1 byte
+              $chunkSize = 2147483647
+
+              $in = [System.IO.File]::OpenRead($name)
+              $buffer = New-Object byte[] $chunkSize
+              $index = 0
+
+              while (($read = $in.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $partName = "{0}.part{1:D3}.gguf" -f $name, $index
+                [System.IO.File]::WriteAllBytes($partName, $buffer[0..($read-1)])
+                $index++
+              }
+
+              $in.Close()
+              Remove-Item $name
+            }
+            else {
+              Write-Host "Compressing with 7z..."
+
+              $level = "${{ inputs.compression_level }}"
+              $archive = "$name.7z"
+
+              7z a -t7z $archive $name -mx=$level -v2147483647b
+
+              Remove-Item $name
+            }
+          }
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "release-$(Get-Date -Format 'yyyyMMddHHmmss')"
+          gh release create $tag -t $tag -n "auto upload"
+
+      - name: Upload with retry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: powershell
+        run: |
+          cd work
+
+          $tag = gh release list --limit 1 | ForEach-Object { ($_ -split "\s+")[0] }
+
+          $files = Get-ChildItem
+
+          foreach ($file in $files) {
+            $success = $false
+
+            for ($i=1; $i -le 3; $i++) {
+              Write-Host "Uploading $($file.Name), attempt $i"
+
+              gh release upload $tag $file.Name --clobber
+
+              if ($LASTEXITCODE -eq 0) {
+                $success = $true
+                break
+              }
+
+              Start-Sleep -Seconds 5
+            }
+
+            if (-not $success) {
+              Write-Error "Failed to upload $($file.Name)"
+              exit 1
+            }
+          }
