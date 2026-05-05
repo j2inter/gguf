@@ -1,12 +1,7 @@
 name: "🧹 Release & Tag 全倉庫大掃除"
 
 on:
-  workflow_dispatch:
-    inputs:
-      confirm_action:
-        description: '請輸入 "DELETE_ALL" 以確認執行刪除操作'
-        required: true
-        default: 'WAIT'
+  workflow_dispatch: # 現在直接點擊即可運行，無需輸入任何值
 
 jobs:
   total-wipeout:
@@ -15,49 +10,41 @@ jobs:
       contents: write
 
     steps:
-      - name: 🛡️ [1/4] 安全校驗與二次確認
-        run: |
-          echo "==== [SAFETY CHECK] ===="
-          if [ "${{ github.event.inputs.confirm_action }}" != "DELETE_ALL" ]; then
-            echo "❌ 安全校驗失敗：輸入值不正確，任務已終止。"
-            exit 1
-          fi
-          echo "✅ 身份驗證通過，準備執行清理任務。"
+      - name: 📥 [1/4] 檢出倉庫代碼
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: 📊 [2/4] 資源普查：當前統計信息
-          # 使用 gh 獲取列表並統計數量
+      - name: 📊 [2/4] 資源普查：掃描當前 Release 與 Tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "==== [SCANNING RESOURCES] ===="
           RELEASE_COUNT=$(gh release list --limit 1000 | wc -l)
-          TAG_COUNT=$(git ls-remote --tags origin | wc -l)
+          TAG_COUNT=$(git tag | wc -l)
           
           echo "📦 當前 Release 總數: $RELEASE_COUNT"
           echo "🏷️ 當前 Tag 總數: $TAG_COUNT"
           
-          if [ "$TAG_COUNT" -eq 0 ]; then
+          if [ "$TAG_COUNT" -eq 0 ] && [ "$RELEASE_COUNT" -eq 0 ]; then
             echo "✅ 倉庫已經非常乾淨，無需進一步清理。"
             exit 0
           fi
 
-      - name: 💣 [3/4] 執行物理刪除：Release + Tag
+      - name: 💣 [3/4] 執行物理刪除：清空所有 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           echo "==== [WIPEOUT START] ===="
-          
-          # 獲取所有 Release 的標籤名
-          # --limit 1000 確保能獲取到足夠多的歷史記錄
           RELEASES=$(gh release list --limit 1000 --json tagName --jq '.[].tagName')
           
           if [ -z "$RELEASES" ]; then
-            echo "💡 未發現任何 Release，切換至純 Tag 清理模式。"
+            echo "💡 未發現任何 Release，跳過此步驟。"
           else
             for tag in $RELEASES; do
               echo "▶️ 正在抹除 Release：$tag ..."
-              # --cleanup-tag 會連同該 Release 對應的 Git Tag 一併刪除
+              # --cleanup-tag 會連同對應的 Git Tag 一併刪除
               gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag
             done
           fi
@@ -67,19 +54,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "==== [FINAL SWEEP] ===="
-          # 有些 Tag 可能沒有對應的 Release，需要單獨清理
-          
-          # 獲取所有遠端 Tag 名稱
-          # 排除含有 ^{} 的項（這些是 Git 的內置指針）
-          REMOTE_TAGS=$(git ls-remote --tags origin | awk '{print $2}' | sed 's/refs\/tags\///' | grep -v "\^{}")
+          # 獲取本地所有剩餘 Tag
+          REMOTE_TAGS=$(git tag)
           
           if [ -z "$REMOTE_TAGS" ]; then
             echo "✅ 所有 Tag 已清理完畢。"
           else
             for rtag in $REMOTE_TAGS; do
               echo "🗑️ 正在刪除殘留 Tag：$rtag ..."
-              # 使用 GitHub API 徹底刪除遠端標籤引用
-              gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$rtag"
+              # 優先嘗試通過 Git 推送刪除，失敗則調用 API 強制刪除
+              git push origin --delete "$rtag" || gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$rtag"
             done
           fi
           
