@@ -1,184 +1,69 @@
-name: "🪟 Windows Extreme Pro: GGUF & 7z Relay"
+name: "🔍 全平台硬件环境深度侦测"
 
 on:
-  workflow_dispatch:
-    inputs:
-      model_url:
-        description: '目標大文件下載地址'
-        required: true
-      file_type:
-        description: '文件類型與切割策略'
-        required: true
-        type: choice
-        options:
-          - gguf
-          - other
-      chunk_size_mb:
-        description: '分卷大小(MB) [最高限制 2047]'
-        required: true
-        default: '2000'
+  workflow_dispatch: # 手动触发
 
 jobs:
-  universal-relay:
-    runs-on: windows-latest # 切換為 Windows
-    permissions:
-      contents: write
-    defaults:
-      run:
-        shell: pwsh # 全局指定使用 PowerShell
+  env-scan:
+    name: 扫描 - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # 一次性定义三个平台
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
-      - name: 💻 [1/9] Windows 硬件環境與系統架構掃描
+      # === Linux 环境扫描 ===
+      - name: 🐧 [Linux] 硬件资源深度扫描
+        if: runner.os == 'Linux'
         run: |
-          Write-Host "==== [SYSTEM INFO START] ===="
+          echo "==== [SYSTEM INFO] ===="
+          echo "内核版本: $(uname -a)"
+          echo "发行版: $(cat /etc/os-release | grep PRETTY_NAME)"
+          
+          echo -e "\n核心架构: $(nproc) Core | $(uname -m)"
+          echo "CPU 型号:"
+          lscpu | grep "Model name"
+          
+          echo -e "\n📊 内存状态:"
+          free -h
+          
+          echo -e "\n💽 磁盘空间:"
+          df -h .
+          
+      # === macOS 环境扫描 ===
+      - name: 🍎 [macOS] 硬件资源深度扫描
+        if: runner.os == 'macOS'
+        run: |
+          echo "==== [SYSTEM INFO] ===="
+          echo "系统版本: $(sw_vers -productVersion) (Build $(sw_vers -buildVersion))"
+          
+          echo -e "\n核心架构: $(sysctl -n hw.ncpu) Core | $(uname -m)"
+          echo "CPU 型号: $(sysctl -n machdep.cpu.brand_string)"
+          
+          echo -e "\n📊 内存状态 (PhysMem):"
+          hostinfo | grep "memory"
+          vm_stat | perl -ne '/page size of (\d+) bytes/ and $s=$1; /Pages (\w+):[\s\t]+(\d+)/ and printf("%-15s %10.2f MB\n", $1, $2*$s/1024/1024);'
+          
+          echo -e "\n💽 磁盘空间:"
+          df -h .
+
+      # === Windows 环境扫描 ===
+      - name: 🪟 [Windows] 硬件资源深度扫描
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Write-Host "==== [SYSTEM INFO] ===="
           $info = Get-ComputerInfo
-          Write-Host "🪟 操作系統: $($info.OsName) ($($info.OsVersion))"
-          Write-Host "🧠 CPU 架構: $env:PROCESSOR_ARCHITECTURE"
-          Write-Host "💡 處理器: $env:PROCESSOR_IDENTIFIER"
-          Write-Host "🚀 核心數: $env:NUMBER_OF_PROCESSORS Core"
+          Write-Host "系统名称: $($info.OsName)"
+          Write-Host "核心架构: $env:NUMBER_OF_PROCESSORS Core | $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "CPU 型号: $env:PROCESSOR_IDENTIFIER"
           
-          Write-Host "`n📊 內存狀態 (MB):"
-          Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory
+          Write-Host "`n📊 内存状态 (GB):"
+          $mem = Get-CimInstance Win32_OperatingSystem
+          $total = [Math]::Round($mem.TotalVisibleMemorySize / 1MB, 2)
+          $free = [Math]::Round($mem.FreePhysicalMemory / 1MB, 2)
+          Write-Host "总量: $total GB | 剩余: $free GB"
           
-          Write-Host "`n💽 磁盤空間狀態:"
-          Get-PSDrive C | Select-Object Name, @{Name="Used(GB)";Expression={"{0:N2}" -f (($_.Used/1GB))}}, @{Name="Free(GB)";Expression={"{0:N2}" -f (($_.Free/1GB))}}
-          Write-Host "==== [SYSTEM INFO END] ===="
-
-      - name: 🔍 [2/9] 物理空間嗅探與動態裁決
-        id: precheck
-        run: |
-          $freeMB = (Get-PSDrive C).Free / 1MB
-          Write-Host "[📈 實時資源監控] 磁盤可用: $([Math]::Round($freeMB, 2)) MB"
-          
-          $url = "${{ github.event.inputs.model_url }}"
-          $headers = curl.exe -sIL $url
-          $sizeLine = $headers | Select-String "Content-Length:" | Select-Object -Last 1
-          
-          if ($sizeLine -match "\d+") {
-              $sizeBytes = [long]$matches[0]
-              $sizeMB = $sizeBytes / 1MB
-              $requiredMB = ($sizeMB * 2) + 2048
-              Write-Host "📦 文件大小: $([Math]::Round($sizeMB, 2)) MB"
-              Write-Host "📈 需求大小: $([Math]::Round($requiredMB, 2)) MB"
-              
-              if ($requiredMB -gt $freeMB) {
-                  Write-Host "🚨 空間不足，觸發清理！"
-                  echo "need_clean=true" >> $env:GITHUB_OUTPUT
-              } else {
-                  Write-Host "✅ 空間充足。"
-                  echo "need_clean=false" >> $env:GITHUB_OUTPUT
-              }
-          } else {
-              Write-Host "⚠️ 無法獲取大小，默認清理。"
-              echo "need_clean=true" >> $env:GITHUB_OUTPUT
-          }
-
-      - name: 🧹 [3/9] Windows 磁盤空間優化
-        if: steps.precheck.outputs.need_clean == 'true'
-        run: |
-          Write-Host "==== [WINDOWS CLEANUP] ===="
-          # Windows 清理：刪除一些大型緩存目錄
-          Remove-Item -Recurse -Force "C:\Program Files\dotnet" -ErrorAction SilentlyContinue
-          Remove-Item -Recurse -Force "C:\Android" -ErrorAction SilentlyContinue
-          Write-Host "🧹 清理完畢。"
-
-      - name: 🛠️ [4/9] Chocolatey 工具鏈部署
-        run: |
-          Write-Host "==== [INSTALLING DEPENDENCIES] ===="
-          choco install aria2 7zip -y --no-progress
-          Write-Host "✅ Aria2 & 7-Zip 部署完畢。"
-
-      - name: 🌐 [5/9] 遠端鏈接解析與元數據註入
-        run: |
-          $url = "${{ github.event.inputs.model_url }}"
-          $rawName = [System.IO.Path]::GetFileName(($url -split '\?')[0])
-          if (-not $rawName) { $rawName = "payload_$(Get-Date -Format 'HHmm').bin" }
-          
-          $baseName = [System.IO.Path]::GetFileNameWithoutExtension($rawName)
-          $safeBaseName = $baseName -replace ' ', '-'
-          $cstTime = Get-Date -Format "yyyyMMdd-HHmm"
-          
-          Add-Content -Path $env:GITHUB_ENV -Value "RAW_NAME=$rawName"
-          Add-Content -Path $env:GITHUB_ENV -Value "BASE_NAME=$safeBaseName"
-          Add-Content -Path $env:GITHUB_ENV -Value "CST_TIME=$cstTime"
-          Write-Host "📄 解析文件名: $rawName"
-
-      - name: ⬇️ [6/9] Aria2 激進併發下載
-        run: |
-          aria2c.exe -x 16 -s 16 -k 1M --console-log-level=notice --file-allocation=none `
-          "${{ github.event.inputs.model_url }}" -o "$env:RAW_NAME"
-          Write-Host "`n✅ 下載完成:"
-          Get-Item "$env:RAW_NAME" | Select-Object Name, @{Name="Size(GB)";Expression={"{0:N2}" -f ($_.Length/1GB)}}
-
-      - name: 🔪 [7/9] PowerShell 智能切割 (GGUF 適配)
-        run: |
-          $raw = "$env:RAW_NAME"
-          $base = "$env:BASE_NAME"
-          $chunkSizeMB = [long]${{ github.event.inputs.chunk_size_mb }}
-          if ($chunkSizeMB -gt 2047) { $chunkSizeMB = 2047 }
-          $chunkSizeBytes = $chunkSizeMB * 1024 * 1024
-          
-          $fileSize = (Get-Item $raw).Length
-          $totalChunks = [Math]::Ceiling($fileSize / $chunkSizeBytes)
-          $totalPad = $totalChunks.ToString("D5")
-          
-          if ("${{ github.event.inputs.file_type }}" -eq "gguf") {
-              Write-Host "👉 [GGUF 模式] 啟動 PowerShell 原生切割..."
-              $stream = [System.IO.File]::OpenRead((Get-Item $raw).FullName)
-              $buffer = New-Object byte[] $chunkSizeBytes
-              for ($i = 1; $i -le $totalChunks; $i++) {
-                  $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
-                  $chunkName = "$base-$($i.ToString("D5"))-of-$totalPad.gguf"
-                  $outStream = [System.IO.File]::Create((Join-Path (Get-Location) $chunkName))
-                  $outStream.Write($buffer, 0, $bytesRead)
-                  $outStream.Close()
-                  Write-Host "✅ 已生成: $chunkName"
-              }
-              $stream.Close()
-          } else {
-              Write-Host "👉 [7z 模式] 執行分卷..."
-              & "C:\Program Files\7-Zip\7z.exe" a -mx0 -v"$($chunkSizeMB)m" "$base.7z" "$raw"
-          }
-          Remove-Item $raw
-          Get-ChildItem "$base*" | Select-Object Name, Length
-
-      - name: 🚀 [8/9] 併發無損上傳 (PowerShell Parallel)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $tag = "$env:BASE_NAME-$env:CST_TIME-${{ github.event.inputs.file_type }}"
-          $repo = $env:GITHUB_REPOSITORY
-          
-          Write-Host "🏷️ 創建 Release: $tag"
-          gh release create "$tag" --repo "$repo" --title "Windows Relay: $env:BASE_NAME"
-          
-          # 使用 PowerShell 7 的併發特性進行上傳 (類似 MAX_JOBS=6)
-          $files = Get-ChildItem "$env:BASE_NAME*"
-          $files | ForEach-Object -Parallel {
-              $file = $_.FullName
-              $fileName = $_.Name
-              $tag = $using:tag
-              $repo = $using:repo
-              
-              Write-Host "▶️ 開始上傳: $fileName"
-              $attempt = 1
-              while ($attempt -le 5) {
-                  gh release upload "$tag" "$file" --repo "$repo" --clobber
-                  if ($LASTEXITCODE -eq 0) {
-                      Write-Host "✅ 成功: $fileName"
-                      return
-                  }
-                  $wait = $attempt * 5
-                  Write-Host "⚠️ 失敗，等待 ${wait}秒..."
-                  Start-Sleep -Seconds $wait
-                  $attempt++
-              }
-              throw "❌ 致命錯誤: $fileName 上傳失敗"
-          } -ThrottleLimit 6
-          
-          Add-Content -Path $env:GITHUB_ENV -Value "URL_TAG=$tag"
-
-      - name: 🎉 [9/9] 任務竣工報告
-        run: |
-          Write-Host "==== [MISSION ACCOMPLISHED] ===="
-          Write-Host "🔗 Release 傳送門: https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:URL_TAG"
+          Write-Host "`n💽 磁盘空间 (C盘):"
+          Get-PSDrive C | Select-Object Name, @{Name="Used(GB)";Expression={"{0:N2}" -f ($_.Used/1GB)}}, @{Name="Free(GB)";Expression={"{0:N2}" -f ($_.Free/1GB)}}
