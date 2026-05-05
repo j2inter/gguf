@@ -1,4 +1,4 @@
-name: "🍎 macOS Extreme Pro: GGUF & 7z Relay"
+name: "🪟 Windows Extreme Pro: GGUF & 7z Relay"
 
 on:
   workflow_dispatch:
@@ -20,138 +20,165 @@ on:
 
 jobs:
   universal-relay:
-    runs-on: macos-latest # 切换为 macOS
+    runs-on: windows-latest # 切換為 Windows
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: pwsh # 全局指定使用 PowerShell
 
     steps:
-      - name: 🍏 [1/9] macOS 硬件環境與系統架構掃描
+      - name: 💻 [1/9] Windows 硬件環境與系統架構掃描
         run: |
-          echo "==== [SYSTEM INFO START] ===="
-          echo "🖥️ 操作系統: $(sw_vers -productVersion) (Build $(sw_vers -buildVersion))"
-          echo "🧠 CPU 架構: $(uname -m)"
-          echo "💡 處理器細節: $(sysctl -n machdep.cpu.brand_string)"
-          echo "🚀 核心數: $(sysctl -n hw.ncpu) Core"
+          Write-Host "==== [SYSTEM INFO START] ===="
+          $info = Get-ComputerInfo
+          Write-Host "🪟 操作系統: $($info.OsName) ($($info.OsVersion))"
+          Write-Host "🧠 CPU 架構: $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "💡 處理器: $env:PROCESSOR_IDENTIFIER"
+          Write-Host "🚀 核心數: $env:NUMBER_OF_PROCESSORS Core"
           
-          echo -e "\n📊 內存分佈 (vm_stat):"
-          vm_stat
+          Write-Host "`n📊 內存狀態 (MB):"
+          Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory
           
-          echo -e "\n💽 磁盤掛載狀態:"
-          df -Th
-          echo "==== [SYSTEM INFO END] ===="
+          Write-Host "`n💽 磁盤空間狀態:"
+          Get-PSDrive C | Select-Object Name, @{Name="Used(GB)";Expression={"{0:N2}" -f (($_.Used/1GB))}}, @{Name="Free(GB)";Expression={"{0:N2}" -f (($_.Free/1GB))}}
+          Write-Host "==== [SYSTEM INFO END] ===="
 
-      - name: 🔍 [2/9] 物理空間嗅探 (macOS 版)
+      - name: 🔍 [2/9] 物理空間嗅探與動態裁決
         id: precheck
         run: |
-          # macOS 監測邏輯
-          FREE_SPACE_MB=$(df -m . | awk 'NR==2 {print $4}')
-          echo -e "\n[📈 實時資源監控] 磁盤可用: ${FREE_SPACE_MB} MB\n"
+          $freeMB = (Get-PSDrive C).Free / 1MB
+          Write-Host "[📈 實時資源監控] 磁盤可用: $([Math]::Round($freeMB, 2)) MB"
           
-          URL="${{ github.event.inputs.model_url }}"
-          SIZE=$(curl -sIL "$URL" | grep -i -E "^Content-Length:" | tail -n 1 | awk '{print $2}' | tr -d '\r')
+          $url = "${{ github.event.inputs.model_url }}"
+          $headers = curl.exe -sIL $url
+          $sizeLine = $headers | Select-String "Content-Length:" | Select-Object -Last 1
           
-          if [ -z "$SIZE" ] || ! [[ "$SIZE" =~ ^[0-9]+$ ]]; then
-            echo "need_clean=true" >> $GITHUB_OUTPUT
-          else
-            SIZE_MB=$((SIZE / 1024 / 1024))
-            REQUIRED_MB=$(( SIZE_MB * 2 + 2048 )) # macOS 緩衝給 2GB
-            if [ "$REQUIRED_MB" -gt "$FREE_SPACE_MB" ]; then
-              echo "need_clean=true" >> $GITHUB_OUTPUT
-            else
-              echo "need_clean=false" >> $GITHUB_OUTPUT
-            fi
-          fi
+          if ($sizeLine -match "\d+") {
+              $sizeBytes = [long]$matches[0]
+              $sizeMB = $sizeBytes / 1MB
+              $requiredMB = ($sizeMB * 2) + 2048
+              Write-Host "📦 文件大小: $([Math]::Round($sizeMB, 2)) MB"
+              Write-Host "📈 需求大小: $([Math]::Round($requiredMB, 2)) MB"
+              
+              if ($requiredMB -gt $freeMB) {
+                  Write-Host "🚨 空間不足，觸發清理！"
+                  echo "need_clean=true" >> $env:GITHUB_OUTPUT
+              } else {
+                  Write-Host "✅ 空間充足。"
+                  echo "need_clean=false" >> $env:GITHUB_OUTPUT
+              }
+          } else {
+              Write-Host "⚠️ 無法獲取大小，默認清理。"
+              echo "need_clean=true" >> $env:GITHUB_OUTPUT
+          }
 
-      - name: 🧹 [3/9] macOS 磁盤空間優化
+      - name: 🧹 [3/9] Windows 磁盤空間優化
         if: steps.precheck.outputs.need_clean == 'true'
         run: |
-          echo "==== [MACOS CLEANUP] ===="
-          # macOS 清理邏輯：刪除 Xcode 舊版本、模擬器等（如果存在）
-          sudo rm -rf /Applications/Xcode_*.app
-          brew cleanup
-          # 注意：jlumbroso/free-disk-space 主要針對 Linux，macOS 需手動清理
+          Write-Host "==== [WINDOWS CLEANUP] ===="
+          # Windows 清理：刪除一些大型緩存目錄
+          Remove-Item -Recurse -Force "C:\Program Files\dotnet" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Android" -ErrorAction SilentlyContinue
+          Write-Host "🧹 清理完畢。"
 
-      - name: 🛠️ [4/9] Brew 工具鏈部署 (核心適配)
+      - name: 🛠️ [4/9] Chocolatey 工具鏈部署
         run: |
-          echo "==== [INSTALLING DEPENDENCIES] ===="
-          # 安裝 coreutils 以獲得 gsplit, gstat 等 GNU 工具
-          brew install aria2 p7zip coreutils
-          echo "✅ GNU Coreutils, Aria2, p7zip 部署完畢。"
+          Write-Host "==== [INSTALLING DEPENDENCIES] ===="
+          choco install aria2 7zip -y --no-progress
+          Write-Host "✅ Aria2 & 7-Zip 部署完畢。"
 
       - name: 🌐 [5/9] 遠端鏈接解析與元數據註入
         run: |
-          URL="${{ github.event.inputs.model_url }}"
-          RAW_NAME=$(basename "${URL%%\?*}")
-          SAFE_BASE_NAME="${RAW_NAME%.*}"
-          SAFE_BASE_NAME="${SAFE_BASE_NAME// /-}"
+          $url = "${{ github.event.inputs.model_url }}"
+          $rawName = [System.IO.Path]::GetFileName(($url -split '\?')[0])
+          if (-not $rawName) { $rawName = "payload_$(Get-Date -Format 'HHmm').bin" }
           
-          echo "RAW_NAME=$RAW_NAME" >> $GITHUB_ENV
-          echo "BASE_NAME=$SAFE_BASE_NAME" >> $GITHUB_ENV
-          echo "CST_TIME=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
+          $baseName = [System.IO.Path]::GetFileNameWithoutExtension($rawName)
+          $safeBaseName = $baseName -replace ' ', '-'
+          $cstTime = Get-Date -Format "yyyyMMdd-HHmm"
+          
+          Add-Content -Path $env:GITHUB_ENV -Value "RAW_NAME=$rawName"
+          Add-Content -Path $env:GITHUB_ENV -Value "BASE_NAME=$safeBaseName"
+          Add-Content -Path $env:GITHUB_ENV -Value "CST_TIME=$cstTime"
+          Write-Host "📄 解析文件名: $rawName"
 
       - name: ⬇️ [6/9] Aria2 激進併發下載
         run: |
-          echo -e "\n[📈 實時資源監控] 磁盤可用: $(df -h . | awk 'NR==2 {print $4}')\n"
-          aria2c -x 16 -s 16 -k 1M --console-log-level=notice --file-allocation=none \
-          "${{ github.event.inputs.model_url }}" -o "${{ env.RAW_NAME }}"
+          aria2c.exe -x 16 -s 16 -k 1M --console-log-level=notice --file-allocation=none `
+          "${{ github.event.inputs.model_url }}" -o "$env:RAW_NAME"
+          Write-Host "`n✅ 下載完成:"
+          Get-Item "$env:RAW_NAME" | Select-Object Name, @{Name="Size(GB)";Expression={"{0:N2}" -f ($_.Length/1GB)}}
 
-      - name: 🔪 [7/9] GNU-Style 分支切割 (適配 macOS)
+      - name: 🔪 [7/9] PowerShell 智能切割 (GGUF 適配)
         run: |
-          echo "==== [SPLIT ENGINE START] ===="
-          RAW="${{ env.RAW_NAME }}"
-          BASE="${{ env.BASE_NAME }}"
-          INPUT_MB="${{ github.event.inputs.chunk_size_mb }}"
-          MAX_BYTES=2147483647
+          $raw = "$env:RAW_NAME"
+          $base = "$env:BASE_NAME"
+          $chunkSizeMB = [long]${{ github.event.inputs.chunk_size_mb }}
+          if ($chunkSizeMB -gt 2047) { $chunkSizeMB = 2047 }
+          $chunkSizeBytes = $chunkSizeMB * 1024 * 1024
           
-          # 使用 gstat (GNU stat) 保持邏輯一致
-          FILE_SIZE=$(gstat -c%s "$RAW")
+          $fileSize = (Get-Item $raw).Length
+          $totalChunks = [Math]::Ceiling($fileSize / $chunkSizeBytes)
+          $totalPad = $totalChunks.ToString("D5")
           
-          USER_BYTES=$((INPUT_MB * 1024 * 1024))
-          if [ "$USER_BYTES" -gt "$MAX_BYTES" ]; then CHUNK_BYTES=$MAX_BYTES; else CHUNK_BYTES=$USER_BYTES; fi
-          
-          TOTAL=$(( (FILE_SIZE + CHUNK_BYTES - 1) / CHUNK_BYTES ))
-          TOTAL_PAD=$(printf "%05d" $TOTAL)
-          
-          if [ "${{ github.event.inputs.file_type }}" = "gguf" ]; then
-            # 使用 gsplit (GNU split) 支持 --additional-suffix
-            gsplit -b $CHUNK_BYTES -d -a 5 --numeric-suffixes=1 \
-                  --additional-suffix="-of-$TOTAL_PAD.gguf" "$RAW" "$BASE-"
-          else
-            7z a -mx0 -v${CHUNK_BYTES}b "${BASE}.7z" "$RAW"
-          fi
-          rm -f "$RAW"
-          ls -lh "${BASE}"*
+          if ("${{ github.event.inputs.file_type }}" -eq "gguf") {
+              Write-Host "👉 [GGUF 模式] 啟動 PowerShell 原生切割..."
+              $stream = [System.IO.File]::OpenRead((Get-Item $raw).FullName)
+              $buffer = New-Object byte[] $chunkSizeBytes
+              for ($i = 1; $i -le $totalChunks; $i++) {
+                  $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
+                  $chunkName = "$base-$($i.ToString("D5"))-of-$totalPad.gguf"
+                  $outStream = [System.IO.File]::Create((Join-Path (Get-Location) $chunkName))
+                  $outStream.Write($buffer, 0, $bytesRead)
+                  $outStream.Close()
+                  Write-Host "✅ 已生成: $chunkName"
+              }
+              $stream.Close()
+          } else {
+              Write-Host "👉 [7z 模式] 執行分卷..."
+              & "C:\Program Files\7-Zip\7z.exe" a -mx0 -v"$($chunkSizeMB)m" "$base.7z" "$raw"
+          }
+          Remove-Item $raw
+          Get-ChildItem "$base*" | Select-Object Name, Length
 
-      - name: 🚀 [8/9] 併發無損上傳與進程監控
+      - name: 🚀 [8/9] 併發無損上傳 (PowerShell Parallel)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
         run: |
-          TAG="${{ env.BASE_NAME }}-${{ env.CST_TIME }}-${{ github.event.inputs.file_type }}"
-          gh release create "$TAG" --repo "$REPO" --title "macOS Relay: ${{ env.BASE_NAME }}"
+          $tag = "$env:BASE_NAME-$env:CST_TIME-${{ github.event.inputs.file_type }}"
+          $repo = $env:GITHUB_REPOSITORY
           
-          # macOS 的 xargs 或併發邏輯與 Linux 略有不同，這裡沿用 Bash 函數
-          upload_with_retry() {
-            local file=$1; local tag=$2; local repo=$3; local attempt=1
-            while [ $attempt -le 5 ]; do
-              if gh release upload "$tag" "$file" --repo "$repo" --clobber; then return 0; fi
-              sleep $((attempt * 5)); attempt=$((attempt + 1))
-            done
-            return 1
-          }
-          export -f upload_with_retry
+          Write-Host "🏷️ 創建 Release: $tag"
+          gh release create "$tag" --repo "$repo" --title "Windows Relay: $env:BASE_NAME"
           
-          # 併發上傳
-          pids=()
-          for f in "${{ env.BASE_NAME }}"*; do
-            upload_with_retry "$f" "$TAG" "$REPO" &
-            pids+=($!)
-            if [[ $(jobs -r | wc -l) -ge 6 ]]; then wait -n; fi
-          done
-          for pid in "${pids[@]}"; do wait $pid || exit 1; done
-          echo "URL_TAG=$TAG" >> $GITHUB_ENV
+          # 使用 PowerShell 7 的併發特性進行上傳 (類似 MAX_JOBS=6)
+          $files = Get-ChildItem "$env:BASE_NAME*"
+          $files | ForEach-Object -Parallel {
+              $file = $_.FullName
+              $fileName = $_.Name
+              $tag = $using:tag
+              $repo = $using:repo
+              
+              Write-Host "▶️ 開始上傳: $fileName"
+              $attempt = 1
+              while ($attempt -le 5) {
+                  gh release upload "$tag" "$file" --repo "$repo" --clobber
+                  if ($LASTEXITCODE -eq 0) {
+                      Write-Host "✅ 成功: $fileName"
+                      return
+                  }
+                  $wait = $attempt * 5
+                  Write-Host "⚠️ 失敗，等待 ${wait}秒..."
+                  Start-Sleep -Seconds $wait
+                  $attempt++
+              }
+              throw "❌ 致命錯誤: $fileName 上傳失敗"
+          } -ThrottleLimit 6
+          
+          Add-Content -Path $env:GITHUB_ENV -Value "URL_TAG=$tag"
 
       - name: 🎉 [9/9] 任務竣工報告
         run: |
-          echo "==== [MISSION ACCOMPLISHED] ===="
-          echo "🔗 Release 傳送門: https://github.com/${{ github.repository }}/releases/tag/${{ env.URL_TAG }}"
+          Write-Host "==== [MISSION ACCOMPLISHED] ===="
+          Write-Host "🔗 Release 傳送門: https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:URL_TAG"
