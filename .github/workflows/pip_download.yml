@@ -1,0 +1,133 @@
+name: "📦 Pip Extreme Pro: Windows Python 3.12 Relay"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pip_command:
+        description: '完整的 pip download 命令 (例如: pip download requests -d .)'
+        required: true
+        default: 'pip download requests'
+      chunk_size_mb:
+        description: '7z 分卷大小(MB)'
+        required: true
+        default: '2000'
+
+jobs:
+  pip-relay:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: 💻 [1/8] Windows 硬件與 Python 3.12 環境掃描
+        run: |
+          Write-Host "==== [SYSTEM INFO START] ===="
+          $info = Get-ComputerInfo
+          Write-Host "🪟 OS: $($info.OsName)"
+          Write-Host "🧠 CPU: $env:PROCESSOR_IDENTIFIER ($env:NUMBER_OF_PROCESSORS Cores)"
+          
+          # 安裝並確認 Python 3.12
+          Write-Host "`n🐍 Python 版本核查:"
+          python --version
+          
+          Write-Host "`n📊 內存與磁盤初始狀態:"
+          Get-PSDrive C | Select-Object Name, @{Name="Free(GB)";Expression={"{0:N2}" -f ($_.Free/1GB)}}
+          Write-Host "==== [SYSTEM INFO END] ===="
+
+      - name: 🐍 [2/8] 配置 Python 3.12 運行環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+
+      - name: 🛠️ [3/8] 工具鏈部署 (Aria2 & 7-Zip)
+        run: |
+          Write-Host "[📈 實時資源監控] 磁盤可用: $(([Math]::Round((Get-PSDrive C).Free / 1GB, 2))) GB"
+          choco install 7zip -y --no-progress
+          Write-Host "✅ 工具部署完畢。"
+
+      - name: 🌐 [4/8] 執行 Pip Download 激進拉取
+        run: |
+          Write-Host "==== [PIP DOWNLOAD START] ===="
+          # 創建專用下載目錄
+          New-Item -ItemType Directory -Path "pip_packages" -Force
+          
+          $cmd = "${{ github.event.inputs.pip_command }}"
+          Write-Host "🚀 執行命令: $cmd --dest pip_packages"
+          
+          # 執行用戶輸入的命令，並強制指定輸出路徑
+          Invoke-Expression "$cmd --dest pip_packages"
+          
+          Write-Host "`n✅ 下載清單:"
+          Get-ChildItem "pip_packages" | Select-Object Name, @{Name="Size(MB)";Expression={"{0:N2}" -f ($_.Length/1MB)}}
+
+      - name: 📄 [5/8] 元數據生成與元註入
+        run: |
+          $cstTime = Get-Date -Format "yyyyMMdd-HHmm"
+          $safeTitle = "pip-packages-$cstTime"
+          
+          Add-Content -Path $env:GITHUB_ENV -Value "TAG_NAME=$safeTitle"
+          Add-Content -Path $env:GITHUB_ENV -Value "CST_TIME=$cstTime"
+          Write-Host "🏷️ 標籤已註入: $safeTitle"
+
+      - name: 🔪 [6/8] 7z 零壓縮極速分卷
+        run: |
+          Write-Host "[📈 實時資源監控] 磁盤可用: $(([Math]::Round((Get-PSDrive C).Free / 1GB, 2))) GB"
+          Write-Host "==== [7Z COMPRESSION START] ===="
+          
+          $chunkSizeMB = "${{ github.event.inputs.chunk_size_mb }}"
+          $tagName = "$env:TAG_NAME"
+          
+          # -mx0: 僅存儲，不壓縮，速度最快
+          # -v: 分卷大小
+          & "C:\Program Files\7-Zip\7z.exe" a -mx0 -v"$($chunkSizeMB)m" "$tagName.7z" ".\pip_packages\*"
+          
+          Write-Host "🧹 刪除原始下載文件以釋放空間..."
+          Remove-Item -Recurse -Force ".\pip_packages\"
+          
+          Write-Host "`n✅ 分卷產物:"
+          Get-ChildItem "$tagName.7z*" | Select-Object Name, @{Name="Size(MB)";Expression={"{0:N2}" -f ($_.Length/1MB)}}
+
+      - name: 🚀 [7/8] 並發無損上傳 (PowerShell Parallel)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "$env:TAG_NAME"
+          $repo = $env:GITHUB_REPOSITORY
+          
+          Write-Host "🏷️ 創建 Release: $tag"
+          gh release create "$tag" --repo "$repo" --title "Pip Relay [$env:CST_TIME]" --notes "Command: ${{ github.event.inputs.pip_command }}"
+          
+          # 獲取所有 7z 分卷文件
+          $files = Get-ChildItem "$tag.7z*"
+          
+          # 使用並發上傳 (ThrottleLimit 6 保持與之前一致)
+          $files | ForEach-Object -Parallel {
+              $file = $_.FullName
+              $fileName = $_.Name
+              $tag = $using:tag
+              $repo = $using:repo
+              
+              Write-Host "▶️ 開始上傳: $fileName"
+              $attempt = 1
+              while ($attempt -le 5) {
+                  gh release upload "$tag" "$file" --repo "$repo" --clobber
+                  if ($LASTEXITCODE -eq 0) {
+                      Write-Host "✅ 成功: $fileName"
+                      return
+                  }
+                  Write-Host "⚠️ 失敗，嘗試第 $attempt 次重試..."
+                  Start-Sleep -Seconds ($attempt * 3)
+                  $attempt++
+              }
+              throw "❌ 致命錯誤: $fileName 上傳失敗"
+          } -ThrottleLimit 6
+
+      - name: 🎉 [8/8] 任務竣工報告
+        run: |
+          Write-Host "==== [MISSION ACCOMPLISHED] ===="
+          Write-Host "[📈 終態資源結算] 磁盤可用: $(([Math]::Round((Get-PSDrive C).Free / 1GB, 2))) GB"
+          Write-Host "🔗 Release 鏈接: https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:TAG_NAME"
