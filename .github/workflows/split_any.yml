@@ -1,4 +1,4 @@
-name: "🚀 Universal Extreme Pro: GGUF & 7z Relay"
+name: "🚀 Universal Extreme Pro: GGUF & 7z Relay V2"
 
 on:
   workflow_dispatch:
@@ -12,7 +12,11 @@ on:
         type: choice
         options:
           - gguf   # 使用 split 进行 GGUF 规范化后缀切割
-          - other  # 使用 7z 仅存储模式分卷 (适合普通大文件)
+          - other  # 使用 7z 仅存储模式分卷
+      split_size_mb:
+        description: '最大分卷大小 (单位: MB)'
+        required: true
+        default: '2000' # 默认 2000MB (约2GB)
 
 jobs:
   universal-relay:
@@ -21,46 +25,76 @@ jobs:
       contents: write
 
     steps:
-      - name: 📊 [1/4] 环境检查与工具安装
+      - name: 🧹 [1/5] 极限清理磁盘空间 (释放 20GB+ 空间)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: 📊 [2/5] 环境检查与工具安装
         run: |
           echo "==== [SYSTEM INFO] ===="
-          # 新增安装 p7zip-full 支持 7z 命令
           sudo apt-get update -qq && sudo apt-get install -y -qq aria2 p7zip-full
           echo "✅ 工具安装完成 (aria2, p7zip)。"
+          # 打印当前可用空间
+          df -h /
 
-      - name: ⚡ [2/4] 智能提取名称与多线程下载
+      - name: ⚡ [3/5] 智能提取名称与多线程下载
         run: |
           echo "==== [DOWNLOAD START] ===="
           URL="${{ github.event.inputs.model_url }}"
           
-          RAW_NAME=$(basename "${URL%%?*}")
+          # 【修复】转义 \? 防止通配符吞噬整个字符串
+          RAW_NAME=$(basename "${URL%%\?*}")
+          
+          # 【修复】兜底机制，防止极端 URL 解析为空
+          if [ -z "$RAW_NAME" ] || [ "$RAW_NAME" = "/" ]; then
+            RAW_NAME="download_$(date +%s).bin"
+          fi
+          
           BASE_NAME="${RAW_NAME%.*}"
           
           echo "原始完整名: $RAW_NAME"
           echo "纯净前缀名: $BASE_NAME"
           
-          echo "RAW_NAME=$RAW_NAME" >> $GITHUB_ENV
-          echo "BASE_NAME=$BASE_NAME" >> $GITHUB_ENV
+          # 【修复】使用 EOF 多行安全注入，防止特殊字符破坏 ENV
+          echo "RAW_NAME<<EOF" >> $GITHUB_ENV
+          echo "$RAW_NAME" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+          echo "BASE_NAME<<EOF" >> $GITHUB_ENV
+          echo "$BASE_NAME" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
           echo "CST_TIME=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
           
           aria2c -x 16 -s 16 -k 1M --console-log-level=notice --file-allocation=none \
           "$URL" -o "$RAW_NAME"
           
-          echo -e "\n✅ 下载完成: $(ls -lh "$RAW_NAME")"
+          echo -e "\n✅ 下载完成:"
+          ls -lh "$RAW_NAME"
 
-      - name: 🔪 [3/4] 智能分支切割 (2GB-1B)
+      - name: 🔪 [4/5] 智能分支切割 (支持自定义MB)
         run: |
           echo "==== [SPLIT START] ===="
           RAW="${{ env.RAW_NAME }}"
           BASE="${{ env.BASE_NAME }}"
           TYPE="${{ github.event.inputs.file_type }}"
-          CHUNK_BYTES=2147483647
+          SPLIT_MB="${{ github.event.inputs.split_size_mb }}"
           
+          # 【新增】将输入的 MB 转换为精确字节数进行切割计算
+          CHUNK_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
           FILE_SIZE=$(stat -c%s "$RAW")
+          
           TOTAL=$(( (FILE_SIZE + CHUNK_BYTES - 1) / CHUNK_BYTES ))
           TOTAL_PAD=$(printf "%05d" $TOTAL)
           
-          echo "检测到策略: [$TYPE] | 文件大小: $FILE_SIZE 字节"
+          echo "检测到策略: [$TYPE] | 文件大小: $FILE_SIZE 字节 | 预设分卷: $SPLIT_MB MB"
           
           if [ "$TYPE" = "gguf" ]; then
             echo "👉 执行 GGUF 标准切割: $RAW -> ${BASE}-XXXXX-of-${TOTAL_PAD}.gguf"
@@ -69,15 +103,15 @@ jobs:
                   "$RAW" "$BASE-"
           else
             echo "👉 执行 7z 仅存储分卷: $RAW -> ${BASE}.7z.001"
-            # -mx0 表示不压缩（仅存储，速度最快），-v 指定分卷的精确字节数
             7z a -mx0 -v${CHUNK_BYTES}b "${BASE}.7z" "$RAW"
           fi
           
-          rm "$RAW"
+          # 切割完成后立刻删除原大文件，释放磁盘空间给后续上传留出余地
+          rm -f "$RAW"
           echo -e "\n✅ 切割完成，产出清单:"
           ls -lh "${BASE}"*
 
-      - name: 🚢 [4/4] 智能命名上传 (6 并发 + 独立重试)
+      - name: 🚢 [5/5] 智能命名上传 (修复并发捕获与空格Tag)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -87,11 +121,14 @@ jobs:
         run: |
           echo "==== [UPLOAD START] ===="
           
-          TAG="${BASE_NAME}-${CST_TIME}-${TYPE}"
+          # 【修复】将 BASE_NAME 中的空格替换为连字符，防止 Git Tag 创建报错崩溃
+          SAFE_BASE_NAME="${BASE_NAME// /-}"
+          TAG="${SAFE_BASE_NAME}-${CST_TIME}-${TYPE}"
           
           gh release create "$TAG" --repo "$REPO" \
             --title "Relay [$TYPE]: $BASE_NAME ($CST_TIME)" \
-            --notes "Source: ${{ github.event.inputs.model_url }}"
+            --notes "Source: ${{ github.event.inputs.model_url }}
+          Split Size: ${{ github.event.inputs.split_size_mb }} MB"
 
           upload_with_retry() {
             local file=$1
@@ -112,12 +149,22 @@ jobs:
           export -f upload_with_retry
           
           MAX_JOBS=6
-          # 自动匹配 ${BASE_NAME}-00001.gguf 或 ${BASE_NAME}.7z.001 等所有前缀一致的文件
+          pids=()
+          
           for f in "${BASE_NAME}"*; do
             upload_with_retry "$f" "$TAG" "$REPO" &
-            if [[ $(jobs -r | wc -l) -ge $MAX_JOBS ]]; then wait -n; fi
+            pids+=($!)
+            
+            # 【修复】使用 wait -n 捕获任意一个后台任务的失败并阻断
+            if [[ $(jobs -r | wc -l) -ge $MAX_JOBS ]]; then 
+              wait -n || exit 1
+            fi
           done
 
-          wait
+          # 【修复】等待并捕获收尾任务的退出状态码
+          for pid in "${pids[@]}"; do
+            wait $pid || exit 1
+          done
+          
           echo -e "\n==== [🎉 中转完成] ===="
           echo "链接: https://github.com/$REPO/releases/tag/$TAG"
