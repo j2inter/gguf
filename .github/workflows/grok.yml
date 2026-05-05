@@ -1,0 +1,194 @@
+name: 下载 & 打包 (7z / GGUF Split)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '模式 (url 或 pip)'
+        required: true
+        type: choice
+        options:
+          - url
+          - pip
+        default: url
+
+      command_or_url:
+        description: '输入 URL 或完整的 pip download 命令（支持 -r requirements.txt、--extra-index-url 等）'
+        required: true
+        type: string
+
+      compression_level:
+        description: '7z 压缩级别 (0-9，9 为最高)'
+        required: true
+        type: choice
+        options:
+          - '0'
+          - '1'
+          - '5'
+          - '7'
+          - '9'
+        default: '5'
+
+      clean_storage:
+        description: '是否先清理存储空间（删除 temp、pip cache 等）'
+        required: true
+        type: boolean
+        default: false
+
+      release_tag:
+        description: 'Release Tag (留空则使用当前时间)'
+        required: false
+        type: string
+
+jobs:
+  download-and-package:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 安装 7-Zip
+        run: |
+          choco install 7zip -y
+          echo "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: 清理存储空间（可选）
+        if: ${{ inputs.clean_storage }}
+        shell: pwsh
+        run: |
+          Write-Host "清理前可用空间: $([math]::round((Get-PSDrive C).Free/1GB,2)) GB"
+          
+          # 清理 pip cache
+          python -m pip cache purge
+          
+          # 清理 temp
+          Remove-Item -Path "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\Users\runneradmin\AppData\Local\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+          
+          Write-Host "清理后可用空间: $([math]::round((Get-PSDrive C).Free/1GB,2)) GB"
+
+      - name: 下载文件
+        shell: pwsh
+        env:
+          COMMAND: ${{ inputs.command_or_url }}
+        run: |
+          $mode = "${{ inputs.mode }}"
+          New-Item -ItemType Directory -Force -Path download_output | Out-Null
+          
+          if ($mode -eq "pip") {
+            Write-Host "执行 pip download: $env:COMMAND"
+            Invoke-Expression "python -m pip download $env:COMMAND -d download_output"
+          } else {
+            Write-Host "下载 URL: $env:COMMAND"
+            Invoke-WebRequest -Uri $env:COMMAND -OutFile "download_output\downloaded_file" -MaximumRetryCount 5 -RetryIntervalSec 5
+          }
+
+      - name: 检测是否为 GGUF 并处理
+        id: package
+        shell: pwsh
+        env:
+          COMP_LEVEL: ${{ inputs.compression_level }}
+        run: |
+          $files = Get-ChildItem -Path download_output -Recurse -File
+          $isGguf = $false
+          
+          foreach ($f in $files) {
+            if ($f.Extension -eq ".gguf") { $isGguf = $true; break }
+          }
+          
+          Write-Host "检测到 GGUF: $isGguf"
+          
+          $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+          $baseName = "package_$timestamp"
+          
+          if ($isGguf) {
+            # GGUF 使用 split 方式（符合 llama.cpp 标准）
+            Write-Host "使用 GGUF 分片模式..."
+            cd download_output
+            
+            foreach ($gguf in (Get-ChildItem *.gguf)) {
+              $outBase = [System.IO.Path]::GetFileNameWithoutExtension($gguf.Name)
+              # 使用 PowerShell split（简单可靠），或安装 llama.cpp 后用 gguf-split
+              $partSize = 2GB - 1
+              $cmd = "cmd /c split -b $partSize `"$($gguf.FullName)`" `"$outBase.`""
+              Invoke-Expression $cmd
+              
+              # 重命名为标准格式 xxx-00001-of-xxxxx.gguf
+              $parts = Get-ChildItem "$outBase.*"
+              $total = $parts.Count
+              $i = 1
+              foreach ($p in $parts | Sort-Object Name) {
+                $newName = "{0}-{1:00000}-of-{2:00000}.gguf" -f $outBase, $i, $total
+                Rename-Item $p.FullName $newName
+                $i++
+              }
+            }
+            $artifactDir = "download_output"
+          } else {
+            # 普通文件用 7z 分卷压缩
+            Write-Host "使用 7z 分卷压缩 (2GB-1)..."
+            $maxSize = "2097151K"  # ≈2GB-1
+            $archiveName = "$baseName.7z"
+            
+            cd download_output
+            7z a -t7z -mx=$env:COMP_LEVEL -v$maxSize "../$archiveName" "*"
+            
+            $artifactDir = ".."
+          }
+          
+          echo "artifact_dir=$artifactDir" >> $env:GITHUB_OUTPUT
+          echo "base_name=$baseName" >> $env:GITHUB_OUTPUT
+          echo "is_gguf=$isGguf" >> $env:GITHUB_OUTPUT
+
+      - name: 准备 Release
+        id: release
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.release_tag }}"
+          if (-not $tag) {
+            $tag = "pkg-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          }
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+          
+          gh release create $tag --title $tag --notes "自动打包: ${{ inputs.mode }} - ${{ inputs.command_or_url }}" --draft
+
+      - name: 上传到 GitHub Release（带重试）
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.release.outputs.tag }}"
+          $dir = "${{ steps.package.outputs.artifact_dir }}"
+          
+          function Upload-With-Retry {
+            param([string]$file)
+            $maxRetries = 3
+            for ($i = 1; $i -le $maxRetries; $i++) {
+              try {
+                Write-Host "上传: $(Split-Path $file -Leaf) (尝试 $i/$maxRetries)"
+                gh release upload $tag $file --clobber
+                return
+              } catch {
+                Write-Host "失败，重试中..." -ForegroundColor Yellow
+                Start-Sleep -Seconds (5 * $i)
+              }
+            }
+            Write-Error "上传失败: $file"
+          }
+          
+          Get-ChildItem -Path $dir -File | ForEach-Object {
+            Upload-With-Retry $_.FullName
+          }
+
+      - name: 清理临时文件
+        if: always()
+        run: Remove-Item -Path download_output, *.7z -Recurse -Force -ErrorAction SilentlyContinue
