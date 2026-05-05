@@ -37,48 +37,50 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 🛠️ [3/8] 工具鏈部署 (Aria2 & 7-Zip)
+      - name: 🛠️ [3/8] 工具鏈部署 (7-Zip & 基礎工具)
         run: |
+          # 修正：移除沒用的 Aria2 標題，或者如果你想要它，就加上 choco install aria2
           choco install 7zip -y --no-progress
-          Write-Host "✅ 工具部署完畢。"
+          Write-Host "✅ 7-Zip 部署完畢。"
 
       - name: 🌐 [4/8] 執行 Pip Download 激進拉取
         run: |
           Write-Host "==== [PIP DOWNLOAD START] ===="
           New-Item -ItemType Directory -Path "pip_packages" -Force
           $cmd = "${{ github.event.inputs.pip_command }}"
-          Write-Host "🚀 執行指令: $cmd --dest pip_packages"
-          Invoke-Expression "$cmd --dest pip_packages"
+          
+          # 自動補全 --dest 參數，確保文件夾受控
+          if ($cmd -notlike "*--dest*") {
+              $cmd = "$cmd --dest pip_packages"
+          }
+          
+          Write-Host "🚀 執行指令: $cmd"
+          Invoke-Expression "$cmd"
+          
           Write-Host "`n✅ 下載清單:"
           Get-ChildItem "pip_packages" | Select-Object Name, @{Name="Size(MB)";Expression={"{0:N2}" -f ($_.Length/1MB)}}
 
       - name: 📄 [5/8] 元數據生成 (時區修正與優化命名)
         run: |
-          # 【時區修正】獲取 UTC 時間並增加 8 小時
-          $nowUTC = [DateTime]::UtcNow
-          $nowCST = $nowUTC.AddHours(8)
+          $nowCST = [DateTime]::UtcNow.AddHours(8)
           $cstTimeFormatted = $nowCST.ToString("yyyyMMdd-HHmm")
           
-          # 【智能命名】提取指令中的關鍵字（如 pip download requests -> requests）
           $rawCmd = "${{ github.event.inputs.pip_command }}"
-          # 移除 pip download 前綴並過濾掉非法字符
           $cleanName = ($rawCmd -replace 'pip download', '').Trim() -replace '[^a-zA-Z0-9_-]', '-'
-          # 如果提取後為空，則使用預設名
           if (-not $cleanName) { $cleanName = "pip-pkg" }
           
-          # 最終生成的 Tag 格式：[名稱]-[時間]
           $tagName = "$($cleanName)-$cstTimeFormatted"
           
           Add-Content -Path $env:GITHUB_ENV -Value "TAG_NAME=$tagName"
-          Add-Content -Path $env:GITHUB_ENV -Value "CST_TIME=$cstTimeFormatted"
           Write-Host "⏰ 實時東八區時間: $cstTimeFormatted"
-          Write-Host "🏷️ 優化後的 Tag 名稱: $tagName"
+          Write-Host "🏷️ Tag 名稱: $tagName"
 
       - name: 🔪 [6/8] 7z 零壓縮極速分卷
         run: |
           Write-Host "==== [7Z COMPRESSION START] ===="
           $chunkSizeMB = "${{ github.event.inputs.chunk_size_mb }}"
           $tagName = "$env:TAG_NAME"
+          # 打包 pip_packages 目錄下的所有內容
           & "C:\Program Files\7-Zip\7z.exe" a -mx0 -v"$($chunkSizeMB)m" "$tagName.7z" ".\pip_packages\*"
           Remove-Item -Recurse -Force ".\pip_packages\"
           Get-ChildItem "$tagName.7z*" | Select-Object Name, @{Name="Size(MB)";Expression={"{0:N2}" -f ($_.Length/1MB)}}
@@ -90,6 +92,7 @@ jobs:
           $tag = "$env:TAG_NAME"
           $repo = $env:GITHUB_REPOSITORY
           gh release create "$tag" --repo "$repo" --title "Pip Relay: $tag" --notes "Command: ${{ github.event.inputs.pip_command }}"
+          
           $files = Get-ChildItem "$tag.7z*"
           $files | ForEach-Object -Parallel {
               $file = $_.FullName; $fileName = $_.Name; $tag = $using:tag; $repo = $using:repo
