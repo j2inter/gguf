@@ -1,0 +1,159 @@
+name: Custom Downloader and Packager
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_type:
+        description: '① 任务类型 (选择 URL 或 pip)'
+        required: true
+        type: choice
+        options:
+          - 'URL'
+          - 'PIP_DOWNLOAD'
+      input_text:
+        description: '① & ② 输入目标URL 或 pip参数 (支持带--index-url等)'
+        required: true
+        type: string
+      compression_level:
+        description: '③ 7z压缩级别 (0=仅存储, 1=最快, 5=标准, 9=极限)'
+        required: true
+        type: choice
+        default: '5'
+        options:
+          - '0'
+          - '1'
+          - '3'
+          - '5'
+          - '7'
+          - '9'
+      expand_storage:
+        description: '⑤ 是否需要先扩展存储空间 (清理系统冗余环境以防磁盘不足)'
+        required: true
+        type: boolean
+        default: false
+
+# 赋予 gh CLI 创建 release 和上传文件的权限
+permissions:
+  contents: write
+
+jobs:
+  download_and_release:
+    # ⑧ 强制使用 Windows 运行环境
+    runs-on: windows-latest
+
+    steps:
+      - name: Expand Storage Space
+        # ⑤ 根据选择清理空间
+        if: ${{ github.event.inputs.expand_storage == 'true' }}
+        shell: bash
+        run: |
+          echo "Cleaning up Windows runner disk space..."
+          # 移除 Windows Runner 上体积庞大但用不到的环境
+          rm -rf /c/android || true
+          rm -rf /c/ProgramData/Docker || true
+          rm -rf "/c/Program Files/dotnet" || true
+          rm -rf /c/Modules || true
+          echo "Disk space freed."
+          df -h
+
+      - name: Set up Windows Python 3.12
+        # ⑧ 指定安装 Windows Python 3.12 纯净版本
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download Target Files
+        shell: bash
+        run: |
+          mkdir -p download_dir
+          cd download_dir
+
+          TASK_TYPE="${{ github.event.inputs.task_type }}"
+          INPUT_TEXT="${{ github.event.inputs.input_text }}"
+
+          if [ "$TASK_TYPE" == "URL" ]; then
+            echo "Downloading from URL: $INPUT_TEXT"
+            # 自动追踪重定向并根据远端 header 使用正确的文件名
+            curl -JLO "$INPUT_TEXT"
+          else
+            echo "Executing pip download..."
+            # ② 尊重原始输入：剔除用户可能连带输入的 "pip download" 前缀，保留后面的参数
+            CLEAN_INPUT=${INPUT_TEXT#pip download }
+            pip download $CLEAN_INPUT
+          fi
+
+      - name: Process and Package (GGUF Split or 7z Volumes)
+        shell: bash
+        run: |
+          mkdir -p release_dir
+          cd download_dir
+          
+          TASK_TYPE="${{ github.event.inputs.task_type }}"
+          COMP_LEVEL="${{ github.event.inputs.compression_level }}"
+          # ⑦ 最大限制为 2GB - 1 字节
+          MAX_SIZE="2147483647" 
+          
+          if [ "$TASK_TYPE" == "URL" ]; then
+            FILE=$(ls -1 | head -n 1)
+            
+            if [[ "$FILE" == *.gguf ]]; then
+              # ④ 如果目标是 gguf 格式，直接 split
+              echo "Detected GGUF file: $FILE"
+              # 先用 Linux 标准指令按最大字节切割，生成 part_tmp_00000, part_tmp_00001
+              split -b $MAX_SIZE -d -a 5 "$FILE" "part_tmp_"
+              
+              TOTAL_PARTS=$(ls part_tmp_* | wc -l)
+              TOTAL_FORMATTED=$(printf "%05d" $TOTAL_PARTS)
+              
+              PART_NUM=1
+              for part in part_tmp_*; do
+                PART_FORMATTED=$(printf "%05d" $PART_NUM)
+                BASENAME="${FILE%.gguf}"
+                # 遵循 gguf 官方模型分卷标准命名：name-00001-of-00005.gguf
+                NEW_NAME="${BASENAME}-${PART_FORMATTED}-of-${TOTAL_FORMATTED}.gguf"
+                mv "$part" "../release_dir/$NEW_NAME"
+                PART_NUM=$((PART_NUM+1))
+              done
+            else
+              # 常规文件进行 7z 压缩分卷
+              echo "Target is not GGUF. Compressing with 7z..."
+              # ③ 允许选择压缩级别；⑦ 指定分卷字节大小
+              7z a "../release_dir/download.7z" "$FILE" -v${MAX_SIZE}b -mx=$COMP_LEVEL
+            fi
+          else
+            # PIP 下载的文件打包为一个 7z 分卷
+            echo "Packaging pip downloads..."
+            7z a "../release_dir/pip_packages.7z" * -v${MAX_SIZE}b -mx=$COMP_LEVEL
+          fi
+
+      - name: Upload to GitHub Releases with Retries
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd release_dir
+          TAG_NAME="release-$(date +'%Y%m%d%H%M%S')"
+          echo "Creating release $TAG_NAME..."
+          
+          gh release create "$TAG_NAME" --title "Auto Download $TAG_NAME" --notes "Automated download and packaging via GitHub Actions."
+          
+          # ⑥ 对生成的每一个分卷进行上传，并带 3 次重试机制
+          for file in *; do
+            success=false
+            for attempt in 1 2 3; do
+              echo "Uploading $file (Attempt $attempt of 3)..."
+              if gh release upload "$TAG_NAME" "$file"; then
+                echo "Upload $file successful!"
+                success=true
+                break
+              else
+                echo "Upload failed. Retrying in 5 seconds..."
+                sleep 5
+              fi
+            done
+            
+            if [ "$success" = false ]; then
+              echo "Error: Failed to upload $file after 3 attempts."
+              exit 1
+            fi
+          done
