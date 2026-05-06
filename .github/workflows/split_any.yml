@@ -1,4 +1,4 @@
-Name: "🚀 Universal Extreme Pro: GGUF & 7z Relay (Hybrid Upload)"
+name: "🚀 Universal Extreme Pro: GGUF & 7z Relay (Hybrid Upload)"
 
 on:
   workflow_dispatch:
