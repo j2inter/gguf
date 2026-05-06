@@ -1,0 +1,43 @@
+name: Remote File Splitter
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: '远程文件的 URL'
+        required: true
+        type: string
+
+jobs:
+  download-and-split:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Disk Space
+        run: |
+          # 清理预装软件以腾出更多空间（约可腾出 15GB+）
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+      - name: Download File
+        run: |
+          echo "正在下载: ${{ github.event.inputs.file_url }}"
+          # -L 跟随重定向, -o 指定输出文件名
+          curl -L "${{ github.event.inputs.file_url }}" -o "large_file.tmp"
+
+      - name: Split File
+        run: |
+          # -b 10G 表示每份 10GB
+          # -d 使用数字后缀
+          # large_file.tmp.part 是生成的文件名前缀
+          mkdir -p ./output
+          split -b 10G -d "large_file.tmp" "./output/part_"
+          rm "large_file.tmp" # 切割完立刻删除原文件，释放空间
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: split-files
+          path: ./output/
+          retention-days: 1 # 节省你的 Actions 存储配额
