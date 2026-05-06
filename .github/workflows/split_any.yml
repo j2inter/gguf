@@ -144,11 +144,12 @@ jobs:
 
       - name: 📦 [8b/9] 上傳至 GitHub Artifacts (大文件模式)
         if: env.MODE == 'artifacts'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7  # 升級至 2026 年最新 v7 版本
         with:
           name: "${{ env.BASE_NAME }}-${{ env.CST_TIME }}-parts"
           path: "${{ env.BASE_NAME }}*"
-          retention-days: 7  # 預設保留 7 天，節省空間
+          retention-days: 7
+          archive: false  # 🚀 啟用新特性：關閉自動 zip 打包，保持獨立文件狀態！
 
       - name: 🎉 [9/9] 任務竣工報告
         run: |
