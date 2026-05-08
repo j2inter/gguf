@@ -8,9 +8,9 @@ on:
         required: true
         type: string
       split_size_mb:
-        description: '请选择或输入分卷大小 (单位: MB)'
+        description: '每个分卷的大小 (单位: MB)'
         required: true
-        default: '8000'
+        default: '7000'
         type: choice
         options:
           - '2000'
@@ -21,27 +21,33 @@ on:
 
 jobs:
   split-and-upload:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # 拥有 70GB 磁盘空间
     steps:
-      - name: 准备依赖库 (aria2) 🛠️
+      - name: 1. 安装下载工具 (aria2) 🛠️
         run: |
           sudo apt-get update
           sudo apt-get install -y aria2
 
-      - name: 获取官方预编译的 llama.cpp 工具 🦙
+      - name: 2. 获取预编译 llama-gguf-split 工具 (最新版) 🦙
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "正在拉取官方预编译版本..."
-          gh release download --repo ggerganov/llama.cpp --pattern "*ubuntu-x64.zip"
-          unzip -q *ubuntu-x64.zip -d llama_bin
+          echo "正在从官方 Release 下载 Ubuntu 预编译包..."
+          # 自动下载最新的 ubuntu-x64 tar.gz 包
+          gh release download --repo ggerganov/llama.cpp --pattern "*ubuntu-x64.tar.gz"
+          
+          mkdir llama_bin
+          tar -xzf *ubuntu-x64.tar.gz -C llama_bin
+          
+          # 寻找二进制文件并移动到根目录
           find llama_bin -name "llama-gguf-split" -type f -exec cp {} ./ \;
           chmod +x ./llama-gguf-split
-          rm -rf llama_bin *.zip
+          rm -rf llama_bin *.tar.gz
 
-      - name: 解析文件名并多线程下载 📥
+      - name: 3. 解析文件名并多线程下载 📥
         run: |
           URL="${{ github.event.inputs.model_url }}"
+          # 智能提取文件名
           RAW_NAME=$(basename "${URL%%\?*}")
           if [ -z "$RAW_NAME" ]; then RAW_NAME="model.gguf"; fi
           BASE_NAME="${RAW_NAME%.*}"
@@ -49,26 +55,64 @@ jobs:
           echo "RAW_NAME=$RAW_NAME" >> $GITHUB_ENV
           echo "BASE_NAME=$BASE_NAME" >> $GITHUB_ENV
 
-          echo "🚀 开始使用 aria2 拉取..."
+          echo "🚀 开始多线程下载 $RAW_NAME (启用磁盘预分配)..."
           aria2c -x 16 -s 16 -j 16 -k 10M --file-allocation=falloc \
                  --console-log-level=warn --summary-interval=10 -o "$RAW_NAME" "$URL"
 
-      - name: 张量级动态分割模型 🧠
+      - name: 4. 张量级分割模型 🧠
         run: |
-          # 获取用户选择的大小并附加上 M 单位
+          # 将 MB 转换为 llama-gguf-split 识别的单位
           SPLIT_SIZE="${{ github.event.inputs.split_size_mb }}M"
           echo "🧠 分割尺寸设定为: $SPLIT_SIZE"
           
           ./llama-gguf-split --split --split-max-size "$SPLIT_SIZE" "$RAW_NAME" "$BASE_NAME"
+          
+          # 删除原始 14GB 大文件腾出空间
           rm "$RAW_NAME"
+          
+          # 扫描生成的分卷并存入环境变量，方便后续 Step 判断
+          echo "FILE_P1=$(ls ${BASE_NAME}-00001-of-*.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
+          echo "FILE_P2=$(ls ${BASE_NAME}-00002-of-*.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
+          echo "FILE_P3=$(ls ${BASE_NAME}-00003-of-*.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
+          echo "FILE_P4=$(ls ${BASE_NAME}-00004-of-*.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
+          echo "FILE_P5=$(ls ${BASE_NAME}-00005-of-*.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
 
-      # 使用通配符批量上传，配合 archive: false 
-      # 注意：如果分卷过多（例如超过10个），建议通过 shell 循环上传
-      # 这里我们通过模式匹配动态上传所有生成的 .gguf 分卷
-      - name: 上传所有生成的分卷 (免压缩) 📤
+      - name: 5a. 上传分卷 1 📤
+        if: env.FILE_P1 != ''
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.BASE_NAME }}_parts
-          path: ./${{ env.BASE_NAME }}-*.gguf
-          # 核心：根据你的新功能说明，设为 false 绕过 zip
+          name: ${{ env.FILE_P1 }}
+          path: ${{ env.FILE_P1 }}
+          archive: false
+
+      - name: 5b. 上传分卷 2 📤
+        if: env.FILE_P2 != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.FILE_P2 }}
+          path: ${{ env.FILE_P2 }}
+          archive: false
+
+      - name: 5c. 上传分卷 3 📤
+        if: env.FILE_P3 != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.FILE_P3 }}
+          path: ${{ env.FILE_P3 }}
+          archive: false
+
+      - name: 5d. 上传分卷 4 📤
+        if: env.FILE_P4 != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.FILE_P4 }}
+          path: ${{ env.FILE_P4 }}
+          archive: false
+
+      - name: 5e. 上传分卷 5 📤
+        if: env.FILE_P5 != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.FILE_P5 }}
+          path: ${{ env.FILE_P5 }}
           archive: false
