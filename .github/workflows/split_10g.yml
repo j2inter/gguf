@@ -1,4 +1,4 @@
-name: 👑 GGUF Pro Split & Download 🚀 (No Zip)
+name: 🎛️ GGUF Master Control Hub 🚀
 
 on:
   workflow_dispatch:
@@ -7,6 +7,14 @@ on:
         description: '大模型 GGUF 直链地址'
         required: true
         type: string
+      split_method:
+        description: '选择分割方式 (Tensor更智能，Brute适合非GGUF)'
+        required: true
+        default: 'Tensor'
+        type: choice
+        options:
+          - 'Tensor (llama-gguf-split)'
+          - 'Brute Force (Linux Split)'
       split_size_mb:
         description: '每个分卷的大小 (单位: MB)'
         required: true
@@ -20,74 +28,96 @@ on:
           - '9500'
 
 jobs:
-  split-and-upload:
+  ultimate-process:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 安装下载工具 (aria2) 🛠️
+      - name: 🔍 [1/6] 硬件环境巡检 (Hardware Audit)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2
+          echo "=== 核心性能指标 ==="
+          echo "CPU 核心数: $(nproc)"
+          lscpu | grep "Model name"
+          echo "内存状态:"
+          free -h
+          echo "硬盘空间 (重点看 / 目录):"
+          df -h /
+          echo "===================="
 
-      - name: 2. 获取预编译工具及依赖库 🦙
+      - name: 🛠️ [2/6] 基础依赖安装 (Dependencies)
+        run: |
+          echo "正在安装 aria2 和工具集..."
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2 -qq
+          echo "✅ 依赖安装完成"
+
+      - name: 🦙 [3/6] 准备 Tensor 分割工具 (仅Tensor模式)
+        if: github.event.inputs.split_method == 'Tensor (llama-gguf-split)'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "正在下载官方预编译包..."
+          echo "📡 正在从 GitHub 官方获取最新的 llama.cpp 预编译组件..."
           gh release download --repo ggerganov/llama.cpp --pattern "*ubuntu-x64.tar.gz"
-          
-          # 【修复点1】：解压到专属文件夹，保留原汁原味的符号链接和目录结构
-          mkdir llama_release
+          mkdir -p llama_release
           tar -xzf *ubuntu-x64.tar.gz -C llama_release
-          rm *.tar.gz
           
-          # 【修复点2】：智能动态查找二进制程序和库文件的目录，不怕官方以后改目录名字
-          SPLIT_BIN=$(find ./llama_release -name "llama-gguf-split" | head -n 1)
-          LIB_DIR=$(dirname $(find ./llama_release -name "libllama-common.so*" | head -n 1))
-          
-          # 赋予执行权限
-          chmod +x "$SPLIT_BIN"
-          
-          echo "工具路径: $SPLIT_BIN"
-          echo "依赖库目录: $LIB_DIR"
-          
-          # 存入环境变量，传递给后续步骤
-          echo "SPLIT_BIN=$SPLIT_BIN" >> $GITHUB_ENV
-          echo "LIB_DIR=$LIB_DIR" >> $GITHUB_ENV
+          # 自动寻址：找出程序和库的真正位置
+          echo "SPLIT_BIN=$(find ./llama_release -name "llama-gguf-split" | head -n 1)" >> $GITHUB_ENV
+          echo "LIB_DIR=$(dirname $(find ./llama_release -name "libllama-common.so*" | head -n 1))" >> $GITHUB_ENV
+          echo "✅ Tensor 工具准备就绪"
 
-      - name: 3. 解析文件名并多线程下载 📥
+      - name: 📥 [4/6] 多线程极速下载 (High-Speed Download)
         run: |
           URL="${{ github.event.inputs.model_url }}"
           RAW_NAME=$(basename "${URL%%\?*}")
-          if [ -z "$RAW_NAME" ]; then RAW_NAME="model.gguf"; fi
+          [ -z "$RAW_NAME" ] && RAW_NAME="unnamed_model.gguf"
           BASE_NAME="${RAW_NAME%.*}"
           
           echo "RAW_NAME=$RAW_NAME" >> $GITHUB_ENV
           echo "BASE_NAME=$BASE_NAME" >> $GITHUB_ENV
 
-          echo "🚀 开始多线程下载..."
+          echo "🚀 启动 aria2 16线程引擎下载: $RAW_NAME"
+          # 使用 --summary-interval=5 增加掌控感，每5秒汇报一次
           aria2c -x 16 -s 16 -j 16 -k 10M --file-allocation=falloc \
-                 --console-log-level=warn --summary-interval=10 -o "$RAW_NAME" "$URL"
+                 --console-log-level=warn --summary-interval=5 -o "$RAW_NAME" "$URL"
+          echo "✅ 下载完成，准备分割..."
 
-      - name: 4. 张量级分割模型 🧠
+      - name: 🔪 [5/6] 执行分割任务 (Splitting)
         run: |
           SPLIT_SIZE="${{ github.event.inputs.split_size_mb }}M"
+          METHOD="${{ github.event.inputs.split_method }}"
           
-          # 【修复点3】：指定库文件搜索路径为我们刚找到的、含有完整软链接的目录
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${{ env.LIB_DIR }}
-          
-          echo "🧠 开始执行分割，尺寸: $SPLIT_SIZE"
-          # 使用绝对路径调用工具
-          ${{ env.SPLIT_BIN }} --split --split-max-size "$SPLIT_SIZE" "$RAW_NAME" "$BASE_NAME"
+          echo "📋 任务摘要:"
+          echo " - 文件名: $RAW_NAME"
+          echo " - 目标分卷: $SPLIT_SIZE"
+          echo " - 采用技术: $METHOD"
+
+          if [[ "$METHOD" == "Tensor (llama-gguf-split)" ]]; then
+              echo "🧠 执行智能张量分割..."
+              export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${{ env.LIB_DIR }}
+              ${{ env.SPLIT_BIN }} --split --split-max-size "$SPLIT_SIZE" "$RAW_NAME" "$BASE_NAME"
+          else
+              echo "⚔️ 执行暴力字节切割 (注意：本地需手动合并)..."
+              # 暴力切割：生成 part_aa, part_ab...
+              split -b "$SPLIT_SIZE" "$RAW_NAME" "${BASE_NAME}-part-"
+              # 为暴力切割的文件加上后缀名，方便下载识别
+              for f in ${BASE_NAME}-part-*; do mv "$f" "$f.gguf"; done
+          fi
           
           rm "$RAW_NAME"
+          echo "--------------------"
+          echo "✅ 分割完成，生成文件清单:"
+          ls -lh *.gguf
           
-          echo "FILE_P1=$(ls ${BASE_NAME}-00001-of-*.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
-          echo "FILE_P2=$(ls ${BASE_NAME}-00002-of-*.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
-          echo "FILE_P3=$(ls ${BASE_NAME}-00003-of-*.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
-          echo "FILE_P4=$(ls ${BASE_NAME}-00004-of-*.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
-          echo "FILE_P5=$(ls ${BASE_NAME}-00005-of-*.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
+          # 注册文件到环境变量以便上传
+          echo "FILE_P1=$(ls ${BASE_NAME}*00001*.gguf 2>/dev/null || ls ${BASE_NAME}-part-aa.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
+          echo "FILE_P2=$(ls ${BASE_NAME}*00002*.gguf 2>/dev/null || ls ${BASE_NAME}-part-ab.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
+          echo "FILE_P3=$(ls ${BASE_NAME}*00003*.gguf 2>/dev/null || ls ${BASE_NAME}-part-ac.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
+          echo "FILE_P4=$(ls ${BASE_NAME}*00004*.gguf 2>/dev/null || ls ${BASE_NAME}-part-ad.gguf 2>/dev/null || echo '')" >> $GITHUB_ENV
 
-      - name: 5a. 上传分卷 1 📤
+      - name: 📤 [6/6] 单文件独立上传 (Uploads)
+        # 这里分成多个独立的 step，确保满足 archive: false
+        run: echo "开始分卷上传流程..."
+
+      - name: 上传 P1
         if: env.FILE_P1 != ''
         uses: actions/upload-artifact@v7
         with:
@@ -95,7 +125,7 @@ jobs:
           path: ${{ env.FILE_P1 }}
           archive: false
 
-      - name: 5b. 上传分卷 2 📤
+      - name: 上传 P2
         if: env.FILE_P2 != ''
         uses: actions/upload-artifact@v7
         with:
@@ -103,7 +133,7 @@ jobs:
           path: ${{ env.FILE_P2 }}
           archive: false
 
-      - name: 5c. 上传分卷 3 📤
+      - name: 上传 P3
         if: env.FILE_P3 != ''
         uses: actions/upload-artifact@v7
         with:
@@ -111,18 +141,10 @@ jobs:
           path: ${{ env.FILE_P3 }}
           archive: false
 
-      - name: 5d. 上传分卷 4 📤
+      - name: 上传 P4
         if: env.FILE_P4 != ''
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.FILE_P4 }}
           path: ${{ env.FILE_P4 }}
-          archive: false
-
-      - name: 5e. 上传分卷 5 📤
-        if: env.FILE_P5 != ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.FILE_P5 }}
-          path: ${{ env.FILE_P5 }}
           archive: false
