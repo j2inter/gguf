@@ -32,18 +32,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "正在下载官方预编译包并提取依赖..."
+          echo "正在下载官方预编译包..."
           gh release download --repo ggerganov/llama.cpp --pattern "*ubuntu-x64.tar.gz"
           
-          mkdir llama_bin
-          tar -xzf *ubuntu-x64.tar.gz -C llama_bin
+          # 【修复点1】：解压到专属文件夹，保留原汁原味的符号链接和目录结构
+          mkdir llama_release
+          tar -xzf *ubuntu-x64.tar.gz -C llama_release
+          rm *.tar.gz
           
-          # 【修复点 1】：不仅拷贝工具本身，还要拷贝所有相关的 .so 共享库文件
-          find llama_bin -name "llama-gguf-split" -type f -exec cp {} ./ \;
-          find llama_bin -name "*.so*" -type f -exec cp {} ./ \;
+          # 【修复点2】：智能动态查找二进制程序和库文件的目录，不怕官方以后改目录名字
+          SPLIT_BIN=$(find ./llama_release -name "llama-gguf-split" | head -n 1)
+          LIB_DIR=$(dirname $(find ./llama_release -name "libllama-common.so*" | head -n 1))
           
-          chmod +x ./llama-gguf-split
-          rm -rf llama_bin *.tar.gz
+          # 赋予执行权限
+          chmod +x "$SPLIT_BIN"
+          
+          echo "工具路径: $SPLIT_BIN"
+          echo "依赖库目录: $LIB_DIR"
+          
+          # 存入环境变量，传递给后续步骤
+          echo "SPLIT_BIN=$SPLIT_BIN" >> $GITHUB_ENV
+          echo "LIB_DIR=$LIB_DIR" >> $GITHUB_ENV
 
       - name: 3. 解析文件名并多线程下载 📥
         run: |
@@ -63,11 +72,12 @@ jobs:
         run: |
           SPLIT_SIZE="${{ github.event.inputs.split_size_mb }}M"
           
-          # 【修复点 2】：设置 LD_LIBRARY_PATH，让程序能在当前目录找到 .so 库文件
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:.
+          # 【修复点3】：指定库文件搜索路径为我们刚找到的、含有完整软链接的目录
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${{ env.LIB_DIR }}
           
           echo "🧠 开始执行分割，尺寸: $SPLIT_SIZE"
-          ./llama-gguf-split --split --split-max-size "$SPLIT_SIZE" "$RAW_NAME" "$BASE_NAME"
+          # 使用绝对路径调用工具
+          ${{ env.SPLIT_BIN }} --split --split-max-size "$SPLIT_SIZE" "$RAW_NAME" "$BASE_NAME"
           
           rm "$RAW_NAME"
           
