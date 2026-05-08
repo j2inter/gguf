@@ -60,6 +60,7 @@ jobs:
           Write-Host "`n✅ 下載清單:"
           Get-ChildItem "pip_packages" | Select-Object Name, @{Name="Size(MB)";Expression={"{0:N2}" -f ($_.Length/1MB)}}
 
+      
       - name: 📄 [5/8] 元數據生成 (時區修正與優化命名)
         run: |
           $nowCST = [DateTime]::UtcNow.AddHours(8)
@@ -67,6 +68,15 @@ jobs:
           
           $rawCmd = "${{ github.event.inputs.pip_command }}"
           $cleanName = ($rawCmd -replace 'pip download', '').Trim() -replace '[^a-zA-Z0-9_-]', '-'
+          
+          # 【關鍵修復1】移除開頭和結尾的多餘橫線
+          $cleanName = $cleanName.Trim('-')
+          
+          # 【關鍵修復2】限制檔名長度，防止包含太多 URL 導致檔名超長 (Windows MAX_PATH 限制)
+          if ($cleanName.Length -gt 60) {
+              $cleanName = $cleanName.Substring(0, 60).Trim('-')
+          }
+          
           if (-not $cleanName) { $cleanName = "pip-pkg" }
           
           $tagName = "$($cleanName)-$cstTimeFormatted"
@@ -80,10 +90,12 @@ jobs:
           Write-Host "==== [7Z COMPRESSION START] ===="
           $chunkSizeMB = "${{ github.event.inputs.chunk_size_mb }}"
           $tagName = "$env:TAG_NAME"
-          # 打包 pip_packages 目錄下的所有內容
-          & "C:\Program Files\7-Zip\7z.exe" a -mx0 -v"$($chunkSizeMB)m" "$tagName.7z" ".\pip_packages\*"
+          
+          # 【關鍵修復3】在檔名前方加上 ".\"，強制 7z 識別為檔案路徑而非參數
+          & "C:\Program Files\7-Zip\7z.exe" a -mx0 -v"$($chunkSizeMB)m" ".\$tagName.7z" ".\pip_packages\*"
+          
           Remove-Item -Recurse -Force ".\pip_packages\"
-          Get-ChildItem "$tagName.7z*" | Select-Object Name, @{Name="Size(MB)";Expression={"{0:N2}" -f ($_.Length/1MB)}}
+          Get-ChildItem ".\$tagName.7z*" | Select-Object Name, @{Name="Size(MB)";Expression={"{0:N2}" -f ($_.Length/1MB)}}
 
       - name: 🚀 [7/8] 並發無損上傳 (PowerShell Parallel)
         env:
