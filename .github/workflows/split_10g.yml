@@ -1,86 +1,74 @@
-name: 👑 GGUF Tensor Split & Download 🚀 (No Zip)
+name: ✂️ GGUF Pro Split & Download 🚀 (No Zip)
 
 on:
   workflow_dispatch:
     inputs:
       model_url:
-        description: '14GB GGUF 文件的直链下载地址'
+        description: '大模型 GGUF 直链地址'
         required: true
         type: string
+      split_size_mb:
+        description: '请选择或输入分卷大小 (单位: MB)'
+        required: true
+        default: '8000'
+        type: choice
+        options:
+          - '2000'
+          - '4000'
+          - '7000'
+          - '8000'
+          - '9500'
 
 jobs:
   split-and-upload:
-    runs-on: ubuntu-latest # 自托管 Runner 请自行修改
+    runs-on: ubuntu-latest
     steps:
-      - name: 安装依赖 (aria2 & 编译工具) 🛠️
+      - name: 准备依赖库 (aria2) 🛠️
         run: |
           sudo apt-get update
-          # 确保系统安装了 cmake
-          sudo apt-get install -y aria2 build-essential cmake
+          sudo apt-get install -y aria2
 
-      - name: 编译 llama-gguf-split 工具 (CMake版) 🦙
+      - name: 获取官方预编译的 llama.cpp 工具 🦙
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "正在克隆 llama.cpp 并使用 CMake 编译分割工具..."
-          git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
-          cd llama.cpp
-          
-          # 1. 生成构建目录
-          cmake -B build
-          # 2. 仅编译 llama-gguf-split 工具（Release模式，运行更快）
-          cmake --build build --config Release --target llama-gguf-split
-          
-          # 3. 智能查找编译好的二进制文件并提取出来备用
-          find build -name "llama-gguf-split" -type f -exec cp {} ../ \;
-          cd ..
+          echo "正在拉取官方预编译版本..."
+          gh release download --repo ggerganov/llama.cpp --pattern "*ubuntu-x64.zip"
+          unzip -q *ubuntu-x64.zip -d llama_bin
+          find llama_bin -name "llama-gguf-split" -type f -exec cp {} ./ \;
+          chmod +x ./llama-gguf-split
+          rm -rf llama_bin *.zip
 
-      - name: 解析文件名并多线程下载 GGUF 📥
-        id: download
+      - name: 解析文件名并多线程下载 📥
         run: |
           URL="${{ github.event.inputs.model_url }}"
-          
           RAW_NAME=$(basename "${URL%%\?*}")
           if [ -z "$RAW_NAME" ]; then RAW_NAME="model.gguf"; fi
           BASE_NAME="${RAW_NAME%.*}"
           
-          echo "获取到的原文件名为: $RAW_NAME"
           echo "RAW_NAME=$RAW_NAME" >> $GITHUB_ENV
           echo "BASE_NAME=$BASE_NAME" >> $GITHUB_ENV
 
-          echo "🚀 开始使用 aria2 多线程拉取 $RAW_NAME ..."
-          aria2c -x 16 -s 16 -j 16 -k 10M \
-                 --console-log-level=warn --summary-interval=10 \
-                 -o "$RAW_NAME" "$URL"
+          echo "🚀 开始使用 aria2 拉取..."
+          aria2c -x 16 -s 16 -j 16 -k 10M --file-allocation=falloc \
+                 --console-log-level=warn --summary-interval=10 -o "$RAW_NAME" "$URL"
 
-      - name: 张量级分割 GGUF 文件 🧠
+      - name: 张量级动态分割模型 🧠
         run: |
-          echo "🧠 正在使用 llama.cpp 在张量层分割模型..."
+          # 获取用户选择的大小并附加上 M 单位
+          SPLIT_SIZE="${{ github.event.inputs.split_size_mb }}M"
+          echo "🧠 分割尺寸设定为: $SPLIT_SIZE"
           
-          # 使用刚编译出来的 llama-gguf-split 进行分割，最大单文件 7.5GB
-          ./llama-gguf-split --split --split-max-size 7500M "$RAW_NAME" "$BASE_NAME"
-          
-          # 删除原始 14GB 文件以腾出空间
+          ./llama-gguf-split --split --split-max-size "$SPLIT_SIZE" "$RAW_NAME" "$BASE_NAME"
           rm "$RAW_NAME"
-          
-          # 自动捕捉生成的文件名
-          PART1=$(ls ${BASE_NAME}-00001-of-*.gguf)
-          PART2=$(ls ${BASE_NAME}-00002-of-*.gguf)
-          
-          echo "生成的分卷1: $PART1"
-          echo "生成的分卷2: $PART2"
-          
-          echo "PART1=$PART1" >> $GITHUB_ENV
-          echo "PART2=$PART2" >> $GITHUB_ENV
 
-      - name: 上传分卷 1 (免压缩) 📤
+      # 使用通配符批量上传，配合 archive: false 
+      # 注意：如果分卷过多（例如超过10个），建议通过 shell 循环上传
+      # 这里我们通过模式匹配动态上传所有生成的 .gguf 分卷
+      - name: 上传所有生成的分卷 (免压缩) 📤
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.PART1 }}
-          path: ${{ env.PART1 }}
-          archive: false
-
-      - name: 上传分卷 2 (免压缩) 📤
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.PART2 }}
-          path: ${{ env.PART2 }}
+          name: ${{ env.BASE_NAME }}_parts
+          path: ./${{ env.BASE_NAME }}-*.gguf
+          # 核心：根据你的新功能说明，设为 false 绕过 zip
           archive: false
