@@ -1,4 +1,4 @@
-name: ✂️ Split & Download GGUF 🚀 (No Zip)
+name: ✂️ Split & Download GGUF 🚀 (No Zip, Fast DL)
 
 on:
   workflow_dispatch:
@@ -12,50 +12,54 @@ jobs:
   split-and-upload:
     runs-on: ubuntu-latest # 如果是自托管 Runner，请替换此项
     steps:
-      - name: 解析文件名并下载 GGUF 📥
+      - name: 安装多线程下载工具 aria2 ⚡
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2
+
+      - name: 解析文件名并多线程下载 GGUF 📥
         id: download
         run: |
           URL="${{ github.event.inputs.model_url }}"
           
-          # 1. 提取 URL 最后的部分作为文件名，并剔除可能携带的 ? 参数（例如 ?download=true）
+          # 1. 提取 URL 最后的部分作为文件名
           RAW_NAME=$(basename "${URL%%\?*}")
-          
-          # 2. 如果提取失败（防呆设计），给个默认名字
           if [ -z "$RAW_NAME" ]; then
             RAW_NAME="model.gguf"
           fi
-          
-          # 3. 去除扩展名，保留核心名字（例如 deepseek-r1.gguf -> deepseek-r1）
           BASE_NAME="${RAW_NAME%.*}"
           
           echo "获取到的原文件名为: $RAW_NAME"
-          echo "文件核心名称为: $BASE_NAME"
-          
-          # 4. 把名字存入环境变量，供后续的上传步骤动态调用
           echo "RAW_NAME=$RAW_NAME" >> $GITHUB_ENV
           echo "BASE_NAME=$BASE_NAME" >> $GITHUB_ENV
 
-          echo "🚀 开始下载 $RAW_NAME ..."
-          wget -q --show-progress -O "$RAW_NAME" "$URL"
+          echo "🚀 开始使用 aria2 多线程拉取 $RAW_NAME ..."
+          
+          # 2. 核心：使用 aria2c 进行 16 线程拉取
+          # -x 16: 每个服务器最大连接数为 16
+          # -s 16: 将文件分割成 16 块同时下载
+          # -j 16: 最大并发任务数为 16
+          # --summary-interval=10: 每 10 秒输出一次进度，避免 Actions 日志刷屏
+          aria2c -x 16 -s 16 -j 16 -k 10M \
+                 --console-log-level=warn --summary-interval=10 \
+                 -o "$RAW_NAME" "$URL"
 
       - name: 分割 GGUF 文件 🔪
         run: |
           echo "🔪 正在分割 $RAW_NAME ..."
           
-          # 按 7GB 切割文件，产生 ${BASE_NAME}_part_aa 和 ${BASE_NAME}_part_ab
+          # 按 7GB 切割文件
           split -b 7G "$RAW_NAME" "${BASE_NAME}_part_"
           
-          # 重命名为公司要求的 .gguf 后缀
+          # 重命名为 .gguf 后缀
           mv "${BASE_NAME}_part_aa" "${BASE_NAME}_part1.gguf"
           mv "${BASE_NAME}_part_ab" "${BASE_NAME}_part2.gguf"
           
-          # 打印结果供日志确认
           ls -lh *.gguf
 
       - name: 上传分卷 1 (免压缩) 📤
         uses: actions/upload-artifact@v7
         with:
-          # 直接使用提取出的动态名字，例如 deepseek-r1_part1.gguf
           name: ${{ env.BASE_NAME }}_part1.gguf
           path: ${{ env.BASE_NAME }}_part1.gguf
           archive: false
