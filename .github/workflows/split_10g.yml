@@ -1,41 +1,49 @@
-name: Multi-thread Remote File Splitter
+name: Split and Download GGUF (No Zip)
 
 on:
   workflow_dispatch:
     inputs:
-      file_url:
-        description: '远程文件的 URL'
+      model_url:
+        description: '14GB GGUF 文件的下载链接'
         required: true
         type: string
 
 jobs:
-  download-and-split:
-    runs-on: ubuntu-latest
+  split-and-upload:
+    # 确保使用你那台 70GB 空间的 Runner
+    runs-on: ubuntu-latest 
     steps:
-      - name: Install aria2
+      - name: Download Original GGUF
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2
+          echo "正在下载 14GB 模型..."
+          wget -q --show-progress -O large_model.gguf "${{ github.event.inputs.model_url }}"
 
-      - name: Multi-thread Download File
+      - name: Split GGUF File
         run: |
-          echo "正在使用 aria2 多线程下载: ${{ inputs.file_url }}"
-          # -x 16: 单个服务器最大连接数为 16
-          # -s 16: 将文件分成 16 个片段同时下载
-          # -k 1M: 文件片段的最小大小
-          # -c: 支持断点续传
-          aria2c -x 16 -s 16 -k 1M -c -d . -o "large_file.tmp" "${{ inputs.file_url }}"
+          echo "正在分割文件..."
+          # 将 14GB 分割为两个 7GB 的块
+          # split 会生成 part_aa 和 part_ab
+          split -b 7G large_model.gguf part_
+          
+          # 重命名为符合公司要求的 .gguf 后缀
+          mv part_aa model_part1.gguf
+          mv part_ab model_part2.gguf
+          
+          # 验证文件大小
+          ls -lh *.gguf
 
-      - name: Split File
-        run: |
-          echo "开始按 10GB 物理切割文件..."
-          mkdir -p ./output
-          split -b 10G -d "large_file.tmp" "./output/part_"
-          rm "large_file.tmp" # 切割完立刻删除原文件以释放空间
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload Part 1 (No Compression)
+        uses: actions/upload-artifact@v7
         with:
-          name: split-files
-          path: ./output/
-          retention-days: 1
+          name: model_part1.gguf
+          path: model_part1.gguf
+          # 关键新特性：不打包成 zip，直接上传原文件
+          archive: false
+
+      - name: Upload Part 2 (No Compression)
+        uses: actions/upload-artifact@v7
+        with:
+          name: model_part2.gguf
+          path: model_part2.gguf
+          # 关键新特性：不打包成 zip，直接上传原文件
+          archive: false
