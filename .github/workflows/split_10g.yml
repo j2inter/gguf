@@ -1,4 +1,4 @@
-name: ✂️ Split & Download GGUF 🚀 (No Zip, Fast DL)
+name: 👑 GGUF Tensor Split & Download 🚀 (No Zip)
 
 on:
   workflow_dispatch:
@@ -10,23 +10,31 @@ on:
 
 jobs:
   split-and-upload:
-    runs-on: ubuntu-latest # 如果是自托管 Runner，请替换此项
+    runs-on: ubuntu-latest # 自托管 Runner 请自行修改
     steps:
-      - name: 安装多线程下载工具 aria2 ⚡
+      - name: 安装依赖 (aria2 & 编译工具) 🛠️
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2
+          sudo apt-get install -y aria2 build-essential cmake
+
+      - name: 编译 llama-gguf-split 工具 🦙
+        run: |
+          echo "正在克隆 llama.cpp 并编译分割工具..."
+          git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
+          cd llama.cpp
+          # 只单独编译我们要用的工具，速度极快（约1分钟）
+          make llama-gguf-split
+          # 将编译好的二进制文件提出来备用
+          cp llama-gguf-split ../
+          cd ..
 
       - name: 解析文件名并多线程下载 GGUF 📥
         id: download
         run: |
           URL="${{ github.event.inputs.model_url }}"
           
-          # 1. 提取 URL 最后的部分作为文件名
           RAW_NAME=$(basename "${URL%%\?*}")
-          if [ -z "$RAW_NAME" ]; then
-            RAW_NAME="model.gguf"
-          fi
+          if [ -z "$RAW_NAME" ]; then RAW_NAME="model.gguf"; fi
           BASE_NAME="${RAW_NAME%.*}"
           
           echo "获取到的原文件名为: $RAW_NAME"
@@ -34,39 +42,41 @@ jobs:
           echo "BASE_NAME=$BASE_NAME" >> $GITHUB_ENV
 
           echo "🚀 开始使用 aria2 多线程拉取 $RAW_NAME ..."
-          
-          # 2. 核心：使用 aria2c 进行 16 线程拉取
-          # -x 16: 每个服务器最大连接数为 16
-          # -s 16: 将文件分割成 16 块同时下载
-          # -j 16: 最大并发任务数为 16
-          # --summary-interval=10: 每 10 秒输出一次进度，避免 Actions 日志刷屏
           aria2c -x 16 -s 16 -j 16 -k 10M \
                  --console-log-level=warn --summary-interval=10 \
                  -o "$RAW_NAME" "$URL"
 
-      - name: 分割 GGUF 文件 🔪
+      - name: 张量级分割 GGUF 文件 🧠
         run: |
-          echo "🔪 正在分割 $RAW_NAME ..."
+          echo "🧠 正在使用 llama.cpp 在张量层分割模型..."
           
-          # 按 7GB 切割文件
-          split -b 7G "$RAW_NAME" "${BASE_NAME}_part_"
+          # 使用 llama-gguf-split 进行分割，最大单文件 7.5GB
+          # 输出文件将自动命名为 ${BASE_NAME}-00001-of-00002.gguf 等格式
+          ./llama-gguf-split --split --split-max-size 7500M "$RAW_NAME" "$BASE_NAME"
           
-          # 重命名为 .gguf 后缀
-          mv "${BASE_NAME}_part_aa" "${BASE_NAME}_part1.gguf"
-          mv "${BASE_NAME}_part_ab" "${BASE_NAME}_part2.gguf"
+          # 删除原始 14GB 文件以防 Runner 爆满（可选，但好习惯）
+          rm "$RAW_NAME"
           
-          ls -lh *.gguf
+          # 自动捕捉生成的文件名，传给下一步
+          PART1=$(ls ${BASE_NAME}-00001-of-*.gguf)
+          PART2=$(ls ${BASE_NAME}-00002-of-*.gguf)
+          
+          echo "生成的分卷1: $PART1"
+          echo "生成的分卷2: $PART2"
+          
+          echo "PART1=$PART1" >> $GITHUB_ENV
+          echo "PART2=$PART2" >> $GITHUB_ENV
 
       - name: 上传分卷 1 (免压缩) 📤
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.BASE_NAME }}_part1.gguf
-          path: ${{ env.BASE_NAME }}_part1.gguf
+          name: ${{ env.PART1 }}
+          path: ${{ env.PART1 }}
           archive: false
 
       - name: 上传分卷 2 (免压缩) 📤
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.BASE_NAME }}_part2.gguf
-          path: ${{ env.BASE_NAME }}_part2.gguf
+          name: ${{ env.PART2 }}
+          path: ${{ env.PART2 }}
           archive: false
