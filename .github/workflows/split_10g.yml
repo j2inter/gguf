@@ -1,49 +1,61 @@
-name: Split and Download GGUF (No Zip)
+name: Fast Split and Download GGUF (No Zip)
 
 on:
   workflow_dispatch:
     inputs:
       model_url:
-        description: '14GB GGUF 文件的下载链接'
+        description: '14GB GGUF 文件的直接下载链接'
         required: true
         type: string
+      model_basename:
+        description: '模型基础名称 (不要带 .gguf 后缀，例如: my-custom-model)'
+        required: true
+        type: string
+        default: 'model'
 
 jobs:
   split-and-upload:
-    # 确保使用你那台 70GB 空间的 Runner
+    # ⚠️ 确保填写你的 70GB runner 标签，例如: self-hosted
     runs-on: ubuntu-latest 
     steps:
-      - name: Download Original GGUF
+      - name: Install aria2 for Multi-threaded Download
         run: |
-          echo "正在下载 14GB 模型..."
-          wget -q --show-progress -O large_model.gguf "${{ github.event.inputs.model_url }}"
+          echo "正在安装 aria2..."
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2
 
-      - name: Split GGUF File
+      - name: Multi-threaded Download GGUF
         run: |
-          echo "正在分割文件..."
-          # 将 14GB 分割为两个 7GB 的块
-          # split 会生成 part_aa 和 part_ab
-          split -b 7G large_model.gguf part_
+          echo "正在使用 16 线程下载模型..."
+          # -x 16: 开启 16 个连接; -s 16: 文件切分成 16 块同时下载; -k 1M: 最小分片大小; -c: 断点续传
+          aria2c -x 16 -s 16 -k 1M -c "${{ github.event.inputs.model_url }}" -o "${{ github.event.inputs.model_basename }}.gguf"
+
+      - name: Split GGUF with Standard Llama.cpp Naming
+        run: |
+          echo "正在分割文件并应用 GGUF 标准命名..."
+          BASENAME="${{ github.event.inputs.model_basename }}"
           
-          # 重命名为符合公司要求的 .gguf 后缀
-          mv part_aa model_part1.gguf
-          mv part_ab model_part2.gguf
+          # 以 7500MB(7.5GB) 为单位分割文件
+          # --numeric-suffixes=1 -a 5 会自动生成后缀为 00001, 00002 的分块文件
+          split -b 7500M "${BASENAME}.gguf" chunk_ --numeric-suffixes=1 -a 5
           
-          # 验证文件大小
+          # 重命名为 llama.cpp 官方支持的分割命名格式
+          mv chunk_00001 "${BASENAME}-00001-of-00002.gguf"
+          mv chunk_00002 "${BASENAME}-00002-of-00002.gguf"
+          
+          echo "✅ 分割完成，文件列表："
           ls -lh *.gguf
 
-      - name: Upload Part 1 (No Compression)
+      - name: Upload Part 1
         uses: actions/upload-artifact@v7
         with:
-          name: model_part1.gguf
-          path: model_part1.gguf
-          # 关键新特性：不打包成 zip，直接上传原文件
-          archive: false
+          name: ${{ github.event.inputs.model_basename }}-00001-of-00002.gguf
+          path: ${{ github.event.inputs.model_basename }}-00001-of-00002.gguf
+          archive: false # 核心！拒绝 zip 打包，直接提供 .gguf 原文件
 
-      - name: Upload Part 2 (No Compression)
+      - name: Upload Part 2
         uses: actions/upload-artifact@v7
         with:
-          name: model_part2.gguf
-          path: model_part2.gguf
-          # 关键新特性：不打包成 zip，直接上传原文件
-          archive: false
+          name: ${{ github.event.inputs.model_basename }}-00002-of-00002.gguf
+          path: ${{ github.event.inputs.model_basename }}-00002-of-00002.gguf
+          archive: false # 同上
