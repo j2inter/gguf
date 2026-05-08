@@ -1,61 +1,68 @@
-name: Fast Split and Download GGUF (No Zip)
+name: ✂️ Split & Download GGUF 🚀 (No Zip)
 
 on:
   workflow_dispatch:
     inputs:
       model_url:
-        description: '14GB GGUF 文件的直接下载链接'
+        description: '14GB GGUF 文件的直链下载地址'
         required: true
         type: string
-      model_basename:
-        description: '模型基础名称 (不要带 .gguf 后缀，例如: my-custom-model)'
-        required: true
-        type: string
-        default: 'model'
 
 jobs:
   split-and-upload:
-    # ⚠️ 确保填写你的 70GB runner 标签，例如: self-hosted
-    runs-on: ubuntu-latest 
+    runs-on: ubuntu-latest # 如果是自托管 Runner，请替换此项
     steps:
-      - name: Install aria2 for Multi-threaded Download
+      - name: 解析文件名并下载 GGUF 📥
+        id: download
         run: |
-          echo "正在安装 aria2..."
-          sudo apt-get update -qq
-          sudo apt-get install -y aria2
+          URL="${{ github.event.inputs.model_url }}"
+          
+          # 1. 提取 URL 最后的部分作为文件名，并剔除可能携带的 ? 参数（例如 ?download=true）
+          RAW_NAME=$(basename "${URL%%\?*}")
+          
+          # 2. 如果提取失败（防呆设计），给个默认名字
+          if [ -z "$RAW_NAME" ]; then
+            RAW_NAME="model.gguf"
+          fi
+          
+          # 3. 去除扩展名，保留核心名字（例如 deepseek-r1.gguf -> deepseek-r1）
+          BASE_NAME="${RAW_NAME%.*}"
+          
+          echo "获取到的原文件名为: $RAW_NAME"
+          echo "文件核心名称为: $BASE_NAME"
+          
+          # 4. 把名字存入环境变量，供后续的上传步骤动态调用
+          echo "RAW_NAME=$RAW_NAME" >> $GITHUB_ENV
+          echo "BASE_NAME=$BASE_NAME" >> $GITHUB_ENV
 
-      - name: Multi-threaded Download GGUF
-        run: |
-          echo "正在使用 16 线程下载模型..."
-          # -x 16: 开启 16 个连接; -s 16: 文件切分成 16 块同时下载; -k 1M: 最小分片大小; -c: 断点续传
-          aria2c -x 16 -s 16 -k 1M -c "${{ github.event.inputs.model_url }}" -o "${{ github.event.inputs.model_basename }}.gguf"
+          echo "🚀 开始下载 $RAW_NAME ..."
+          wget -q --show-progress -O "$RAW_NAME" "$URL"
 
-      - name: Split GGUF with Standard Llama.cpp Naming
+      - name: 分割 GGUF 文件 🔪
         run: |
-          echo "正在分割文件并应用 GGUF 标准命名..."
-          BASENAME="${{ github.event.inputs.model_basename }}"
+          echo "🔪 正在分割 $RAW_NAME ..."
           
-          # 以 7500MB(7.5GB) 为单位分割文件
-          # --numeric-suffixes=1 -a 5 会自动生成后缀为 00001, 00002 的分块文件
-          split -b 7500M "${BASENAME}.gguf" chunk_ --numeric-suffixes=1 -a 5
+          # 按 7GB 切割文件，产生 ${BASE_NAME}_part_aa 和 ${BASE_NAME}_part_ab
+          split -b 7G "$RAW_NAME" "${BASE_NAME}_part_"
           
-          # 重命名为 llama.cpp 官方支持的分割命名格式
-          mv chunk_00001 "${BASENAME}-00001-of-00002.gguf"
-          mv chunk_00002 "${BASENAME}-00002-of-00002.gguf"
+          # 重命名为公司要求的 .gguf 后缀
+          mv "${BASE_NAME}_part_aa" "${BASE_NAME}_part1.gguf"
+          mv "${BASE_NAME}_part_ab" "${BASE_NAME}_part2.gguf"
           
-          echo "✅ 分割完成，文件列表："
+          # 打印结果供日志确认
           ls -lh *.gguf
 
-      - name: Upload Part 1
+      - name: 上传分卷 1 (免压缩) 📤
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ github.event.inputs.model_basename }}-00001-of-00002.gguf
-          path: ${{ github.event.inputs.model_basename }}-00001-of-00002.gguf
-          archive: false # 核心！拒绝 zip 打包，直接提供 .gguf 原文件
+          # 直接使用提取出的动态名字，例如 deepseek-r1_part1.gguf
+          name: ${{ env.BASE_NAME }}_part1.gguf
+          path: ${{ env.BASE_NAME }}_part1.gguf
+          archive: false
 
-      - name: Upload Part 2
+      - name: 上传分卷 2 (免压缩) 📤
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ github.event.inputs.model_basename }}-00002-of-00002.gguf
-          path: ${{ github.event.inputs.model_basename }}-00002-of-00002.gguf
-          archive: false # 同上
+          name: ${{ env.BASE_NAME }}_part2.gguf
+          path: ${{ env.BASE_NAME }}_part2.gguf
+          archive: false
