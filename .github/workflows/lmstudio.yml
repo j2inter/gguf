@@ -1,9 +1,9 @@
 name: Download LM Studio CUDA 12 Runtime & Release
 
 on:
-  workflow_dispatch:        # 手动触发
+  workflow_dispatch:
   schedule:
-    - cron: '0 3 * * 0'     # 每周日凌晨3点自动运行（可选）
+    - cron: '0 3 * * 0'   # 每周自动更新（可选）
 
 jobs:
   download-and-release:
@@ -13,63 +13,69 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install LM Studio Headless (llmster + CLI)
+      - name: Install LM Studio Headless (llmster)
         run: |
-          Write-Host "Installing LM Studio headless CLI (llmster)..."
+          Write-Host "Installing LM Studio headless..."
           irm https://lmstudio.ai/install.ps1 | iex
         shell: pwsh
 
       - name: Add lms to PATH
         run: |
-          $lmstudioBin = "$env:USERPROFILE\.lmstudio\bin"
-          echo $lmstudioBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
-          $env:PATH = "$lmstudioBin;$env:PATH"
+          $binPath = "$env:USERPROFILE\.lmstudio\bin"
+          echo $binPath | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          $env:PATH = "$binPath;$env:PATH"
         shell: pwsh
 
-      - name: Verify lms CLI
+      - name: Verify lms
+        run: lms --version
+        shell: pwsh
+
+      - name: List available runtimes (调试用)
         run: |
-          lms --version
+          Write-Host "=== Available Runtimes ==="
+          lms runtime get --help
+        shell: pwsh
+
+      - name: Download CUDA 12 Runtime (核心修复)
+        run: |
+          Write-Host "Downloading CUDA 12 llama.cpp Runtime..."
+          # 先尝试精确名称（最常用）
+          lms runtime get "CUDA 12 llama.cpp (Windows)" --yes --force || ^
+          lms runtime get "CUDA 12" --yes --force || ^
+          lms runtime get cuda12 --yes --force
+        shell: pwsh
+
+      - name: Check installed runtimes
+        run: |
+          Write-Host "=== Installed Runtimes ==="
           lms runtime ls
         shell: pwsh
 
-      - name: Download CUDA 12 Runtime
-        run: |
-          Write-Host "Downloading CUDA 12 Runtime..."
-          # 非交互式下载（推荐写法）
-          lms runtime get "CUDA 12 llama.cpp (Windows)" --yes --force
-        shell: pwsh
-
-      - name: List installed runtimes (检查)
-        run: |
-          lms runtime ls
-        shell: pwsh
-
-      - name: Zip the runtime folder
+      - name: Zip Runtime Folder
         run: |
           $runtimePath = "$env:USERPROFILE\.lmstudio\runtimes"
           $zipPath = "lmstudio-cuda12-runtime.zip"
           
-          if (Test-Path $runtimePath) {
+          if (Test-Path "$runtimePath") {
             Compress-Archive -Path "$runtimePath\*" -DestinationPath $zipPath -Force
-            Write-Host "✅ Runtime successfully zipped: $zipPath"
+            Write-Host "✅ Successfully zipped: $zipPath"
           } else {
-            Write-Error "❌ Runtime folder not found!"
+            Write-Error "❌ No runtime folder found!"
             exit 1
           }
         shell: pwsh
 
-      - name: Upload to GitHub Release
+      - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: cuda12-runtime-latest
-          name: LM Studio CUDA 12 Runtime (Auto ${{ github.run_number }})
+          name: LM Studio CUDA 12 Runtime (Latest)
           body: |
             自动打包的 LM Studio CUDA 12 llama.cpp Runtime（Windows）
             
-            下载日期: ${{ format('{0:yyyy-MM-dd HH:mm:ss}', github.event.repository.updated_at) }}
             使用方法：
-            1. 解压 lmstudio-cuda12-runtime.zip
-            2. 覆盖到 `C:\Users\你的用户名\.lmstudio\runtimes\` 文件夹
+            1. 下载 lmstudio-cuda12-runtime.zip
+            2. 解压后覆盖到 `C:\Users\你的用户名\.lmstudio\runtimes\`
           files: lmstudio-cuda12-runtime.zip
           draft: false
           prerelease: false
