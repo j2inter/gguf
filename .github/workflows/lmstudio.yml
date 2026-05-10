@@ -1,0 +1,77 @@
+name: Download LM Studio CUDA 12 Runtime & Release
+
+on:
+  workflow_dispatch:        # 手动触发
+    inputs:
+      version:
+        description: 'LM Studio 版本标签 (留空用 latest)'
+        required: false
+        default: ''
+
+  schedule:
+    - cron: '0 2 * * 0'     # 每周日凌晨2点自动运行（可选）
+
+jobs:
+  download-and-release:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install LM Studio CLI (lms)
+        run: |
+          # 通过 npx 安装最新 CLI（不需要完整安装 LM Studio）
+          npx lmstudio install-cli --force
+          echo "$USERPROFILE\.lmstudio\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+        shell: pwsh
+
+      - name: Verify lms CLI
+        run: |
+          lms --version
+        shell: pwsh
+
+      - name: Download CUDA 12 Runtime
+        run: |
+          # 非交互式下载 CUDA 12（如果 interactive 失败可手动调整）
+          echo "Downloading CUDA 12 llama.cpp runtime..."
+          lms runtime get cuda12 --yes
+          
+          # 或者用下面这行更精确（推荐）
+          # lms runtime get "CUDA 12 llama.cpp (Windows)" --yes
+        shell: pwsh
+
+      - name: List downloaded runtimes (检查)
+        run: |
+          lms runtime ls
+        shell: pwsh
+
+      - name: Zip the runtime folder
+        run: |
+          $runtimePath = "$env:USERPROFILE\.lmstudio\runtimes"
+          $zipPath = "lmstudio-cuda12-runtime.zip"
+          
+          if (Test-Path $runtimePath) {
+            Compress-Archive -Path "$runtimePath\*" -DestinationPath $zipPath -Force
+            echo "✅ Runtime zipped: $zipPath"
+          } else {
+            echo "❌ Runtime folder not found!"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cuda12-runtime-${{ github.run_number }}   # 或固定 tag: cuda12-latest
+          name: LM Studio CUDA 12 Runtime (Auto Build ${{ github.run_number }})
+          body: |
+            自动打包的 LM Studio CUDA 12 llama.cpp Runtime（Windows）
+            
+            - 下载日期: ${{ github.event.head_commit.timestamp || '手动触发' }}
+            - 使用方法：解压后覆盖 `~/.lmstudio/runtimes/` 文件夹即可
+          files: lmstudio-cuda12-runtime.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
