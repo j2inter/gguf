@@ -1,9 +1,11 @@
 name: 💥 刪除所有Actions紀錄
-on: workflow_dispatch
+on:
+  workflow_dispatch:
 jobs:
   clean:
     runs-on: ubuntu-latest
-    permissions: actions: write
+    permissions:
+      actions: write
     steps:
       - uses: Mattraks/delete-workflow-runs@v2
         with:
