@@ -1,0 +1,16 @@
+name: 🧹 清空所有Actions歷史紀錄
+
+on:
+  workflow_dispatch: # 手動點擊按鈕觸發
+jobs:
+  clear-history:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 0          # 不保留任何天數
+          keep_minimum_runs: 1    # 降到最低：只留最後 1 次
