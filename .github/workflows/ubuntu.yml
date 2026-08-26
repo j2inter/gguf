@@ -1,0 +1,44 @@
+name: Pip Download and Split 7z
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: '请输入 pip3 download 命令或完整指令 (例: pip3 download requests)'
+        required: true
+        default: 'pip3 download requests'
+      volume_size:
+        description: '分卷大小 (例: 10m 表示 10MB, 500k 表示 500KB)'
+        required: true
+        default: '50m'
+
+jobs:
+  run-and-compress:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码 (可选)
+        uses: actions/checkout@v4
+
+      - name: 安装依赖工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
+      - name: 执行输入的指令
+        run: |
+          mkdir -p downloads
+          cd downloads
+          # 执行用户输入的命令
+          eval "${{ github.event.inputs.command }}"
+      - name: 使用 7z 进行分卷压缩
+        run: |
+          # 将 downloads 目录压缩并分卷，-v后面跟分卷大小
+          7z a -v${{ github.event.inputs.volume_size }} downloaded_files.7z downloads/
+      - name: 上传压缩包到 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: split-7z-archives
+          path: downloaded_files.7z.*
+
+
+    
