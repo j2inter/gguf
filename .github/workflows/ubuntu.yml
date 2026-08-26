@@ -34,11 +34,16 @@ jobs:
         run: |
           # 将 downloads 目录压缩并分卷，-v后面跟分卷大小
           7z a -v${{ github.event.inputs.volume_size }} downloaded_files.7z downloads/
-      - name: 上传压缩包到 Artifacts
-        uses: actions/upload-artifact@v4
+      - name: 自动创建 Release 并上传分卷文件
+        uses: softprops/action-gh-release@v2
         with:
-          name: split-7z-archives
-          path: downloaded_files.7z.*
+          tag_name: "download-${{ github.run_id }}"
+          name: "Pip Downloads (Run #${{ github.run_number }})"
+          body: |
+            ### 运行的指令：
+            `${{ github.event.inputs.command }}`
+          files: |
+            downloaded_files.7z.*
 
 
     
