@@ -11,7 +11,8 @@ on:
         description: '分卷大小 (例: 10m 表示 10MB, 500k 表示 500KB)'
         required: true
         default: '50m'
-
+permissions:
+  contents: write
 jobs:
   run-and-compress:
     runs-on: ubuntu-latest
