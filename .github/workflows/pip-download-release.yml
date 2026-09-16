@@ -61,21 +61,48 @@ jobs:
       - name: First compression (single .7z)
         shell: pwsh
         run: |
-          $pkg = "${{ steps.vars.outputs.pkg }}"
-          $first = "$pkg.7z"
-          & "C:\Program Files\7-Zip\7z.exe" a -t7z -mx=5 $first "./download/*"
-          if ($LASTEXITCODE -ne 0) { throw "7z first archive failed" }
-          Get-Item $first | Select-Object Name, Length
+          $pkg  = "${{ steps.vars.outputs.pkg }}"
+          $sz   = "C:\Program Files\7-Zip\7z.exe"
+          $here = (Get-Location).Path
+          $first = Join-Path $here "$pkg.7z"
+          $src   = Join-Path $here "download"
+          Write-Host "PWD       : $here"
+          Write-Host "Source    : $src"
+          Write-Host "Inner 7z  : $first"
+          if (-not (Test-Path $src)) { throw "source dir not found: $src" }
+          if (Test-Path $first) { Remove-Item -Force $first }
+          $out = & $sz a -t7z -mx=5 -y $first "$src\*" 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host "---- 7z output ----"
+          Write-Host $out
+          Write-Host "---- exit code: $code ----"
+          if ($code -ge 2) { throw "7z first archive FAILED (exit=$code)" }
+          if ($code -eq 1) { Write-Host "::warning::7z first archive returned warnings (exit=1)" }
+          Get-ChildItem $first | Select-Object FullName, Length
 
       - name: Second compression (split volumes)
         shell: pwsh
         run: |
-          $pkg = "${{ steps.vars.outputs.pkg }}"
+          $pkg  = "${{ steps.vars.outputs.pkg }}"
           $size = "${{ inputs.volume_size }}"
-          $first = "$pkg.7z"
-          & "C:\Program Files\7-Zip\7z.exe" a -t7z -mx=5 -v$size "$pkg.outer.7z" $first
-          if ($LASTEXITCODE -ne 0) { throw "7z split archive failed" }
-          Get-ChildItem "$pkg.outer.7z.*" | Select-Object Name, Length
+          $sz   = "C:\Program Files\7-Zip\7z.exe"
+          $here = (Get-Location).Path
+          $first = Join-Path $here "$pkg.7z"
+          $outer = Join-Path $here "$pkg.outer.7z"
+          Write-Host "PWD       : $here"
+          Write-Host "Inner 7z  : $first  (exists=$(Test-Path $first))"
+          Write-Host "Outer 7z  : $outer"
+          Write-Host "Volume sz : $size"
+          if (-not (Test-Path $first)) { throw "inner archive not found: $first" }
+          Get-ChildItem "$pkg.outer.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
+          $out = & $sz a -t7z -mx=5 -y -v"$size" $outer $first 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host "---- 7z output ----"
+          Write-Host $out
+          Write-Host "---- exit code: $code ----"
+          if ($code -ge 2) { throw "7z split archive FAILED (exit=$code)" }
+          if ($code -eq 1) { Write-Host "::warning::7z split archive returned warnings (exit=1)" }
+          Get-ChildItem "$pkg.outer.7z*" | Select-Object Name, Length
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
