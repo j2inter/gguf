@@ -136,32 +136,43 @@ jobs:
           if ($inner -le 64) { Write-Host $out; throw "first 7z is suspiciously small ($inner bytes)" }
           Write-Host "Inner 7z: $inner bytes ($([math]::Round($inner/1MB,2)) MB)"
 
-          # ---- 分卷大小自校正：保证至少切成 2 份 ----
-          # 关键：基于「字节」而不是「MB」计算，否则 <1MB 的文件被 ceil 成 1MB，
-          #       ceil(1MB/2)=1MB 仍大于实际大小，导致只切出 1 卷（旧 bug）。
-          $userVolBytes = [int64]$volMB * 1MB
-          $partsIfUseRaw = [math]::Ceiling($inner / $userVolBytes)
-          if ($partsIfUseRaw -lt 2) {
-            $volBytes = [math]::Max(1, [int64][math]::Ceiling($inner / 2))
-            Write-Host "Auto-shrink volume: ${volMB}MB -> ${volBytes} bytes (force >= 2 parts; inner=${inner} bytes)"
-            $volArg = "-v${volBytes}b"
-          } else {
-            $volArg = "-v${volMB}m"
-            Write-Host "Volume: ${volMB}MB  (will produce ~${partsIfUseRaw} parts)"
-          }
+          # ---- 探测：先做一次非分卷的 outer 7z，仅为测出真实大小 ----
+          # 必要原因：outer = inner + 7z 容器 header (~200B)。
+          # 旧版按 inner 算分卷，外层多出的 header 会"溢出"出第 3 卷（小文件场景下肉眼可见的 bug）
+          $probe = "$pkg.outer.probe.7z"
+          if (Test-Path $probe) { Remove-Item -Force $probe }
+          $out = & $sz a -t7z -mx=0 -y $probe "$pkg.7z" 2>&1 | Out-String
+          if ($LASTEXITCODE -ge 2) { Write-Host $out; throw "probe 7z failed" }
+          $outer = [int64](Get-Item $probe).Length
+          Remove-Item -Force $probe
+          Write-Host "Outer (probe): $outer bytes  (7z overhead = $($outer - $inner) bytes)"
 
-          # ---- 第二层：分卷压缩 + 重命名加 .7z 后缀 ----
+          # ---- 分卷大小决策：基于真实 outer，单位 bytes ----
+          $userVolBytes = [int64]$volMB * 1MB
+          $partsIfUser  = [math]::Ceiling($outer / $userVolBytes)
+          if ($partsIfUser -ge 2) {
+            $volBytes = $userVolBytes
+            $note = "用户设定 ${volMB}MB，约 ${partsIfUser} 卷"
+          } else {
+            $volBytes = [math]::Max(1, [int64][math]::Ceiling($outer / 2))
+            $note = "auto-shrink：用户 ${volMB}MB 只能切 1 卷，改为 ${volBytes} bytes 强制 2 卷"
+          }
+          Write-Host "Volume decided: $volBytes bytes  ($note)"
+
+          # ---- 第二层：正式分卷 ----
           Get-ChildItem "$pkg.outer.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
-          $out = & $sz a -t7z -mx=0 -y $volArg "$pkg.outer.7z" "$pkg.7z" 2>&1 | Out-String
+          $out = & $sz a -t7z -mx=0 -y "-v${volBytes}b" "$pkg.outer.7z" "$pkg.7z" 2>&1 | Out-String
           if ($LASTEXITCODE -ge 2) { Write-Host $out; throw "split 7z failed (exit=$LASTEXITCODE)" }
 
           # 防火墙只放行 .7z -> 给每个 .001/.002 追加一层 .7z
           Get-ChildItem "$pkg.outer.7z.*" | Where-Object { $_.Name -notlike '*.7z.7z' } | ForEach-Object {
             Rename-Item $_.FullName -NewName "$($_.Name).7z"
           }
-          Write-Host "---- final volumes ----"
+
           # 删掉内层 .7z，避免 release 误上传
           Remove-Item -Force "$pkg.7z"
+
+          Write-Host "---- final volumes ----"
           Get-ChildItem "$pkg.outer.7z.*.7z" | Select-Object Name, Length, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}
 
       - name: Upload to GitHub Release
