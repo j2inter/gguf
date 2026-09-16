@@ -136,32 +136,30 @@ jobs:
           if ($inner -le 64) { Write-Host $out; throw "first 7z is suspiciously small ($inner bytes)" }
           Write-Host "Inner 7z: $inner bytes ($([math]::Round($inner/1MB,2)) MB)"
 
-          # ---- 探测：先做一次非分卷的 outer 7z，仅为测出真实大小 ----
-          # 必要原因：outer = inner + 7z 容器 header (~200B)。
-          # 旧版按 inner 算分卷，外层多出的 header 会"溢出"出第 3 卷（小文件场景下肉眼可见的 bug）
-          $probe = "$pkg.outer.probe.7z"
-          if (Test-Path $probe) { Remove-Item -Force $probe }
-          $out = & $sz a -t7z -mx=0 -y $probe "$pkg.7z" 2>&1 | Out-String
-          if ($LASTEXITCODE -ge 2) { Write-Host $out; throw "probe 7z failed" }
-          $outer = [int64](Get-Item $probe).Length
-          Remove-Item -Force $probe
-          Write-Host "Outer (probe): $outer bytes  (7z overhead = $($outer - $inner) bytes)"
-
-          # ---- 分卷大小决策：基于真实 outer，单位 bytes ----
+          # ---- 分卷大小决策（无 probe，按用户授权"不要求等大"）----
+          # outer = inner + ~200B（7z 容器 header 开销）；留 4KB 安全余量
+          # 公式：
+          #  - 用户值能切 ≥2 卷（按 inner 保守估算）  -> 直接用 -v{userMB}m
+          #  - 否则                                   -> vol = ceil((inner + 4096) / 2) 字节，强制 2 卷
+          # 数学保证（inner > 4KB）：2*vol = inner + 4096 > outer ⇒ 不超过 2 卷；
+          #                           vol = inner/2 + 2048 < outer ⇒ 至少 2 卷
           $userVolBytes = [int64]$volMB * 1MB
-          $partsIfUser  = [math]::Ceiling($outer / $userVolBytes)
+          $partsIfUser  = [math]::Ceiling($inner / $userVolBytes)
           if ($partsIfUser -ge 2) {
-            $volBytes = $userVolBytes
-            $note = "用户设定 ${volMB}MB，约 ${partsIfUser} 卷"
+            $volArg = "-v${volMB}m"
+            Write-Host "Volume: ${volMB} MB  (将切 ~${partsIfUser} 卷)"
           } else {
-            $volBytes = [math]::Max(1, [int64][math]::Ceiling($outer / 2))
-            $note = "auto-shrink：用户 ${volMB}MB 只能切 1 卷，改为 ${volBytes} bytes 强制 2 卷"
+            if ($inner -lt 4096) {
+              Write-Host "::warning::inner=$inner bytes < 4KB，自校正公式不严格保证 2 卷；继续。"
+            }
+            $volBytes = [math]::Max(1, [int64][math]::Ceiling(($inner + 4096) / 2))
+            $volArg = "-v${volBytes}b"
+            Write-Host "Auto-shrink: 用户 ${volMB}MB -> ${volBytes} bytes (强制 2 卷，第二卷会略小)"
           }
-          Write-Host "Volume decided: $volBytes bytes  ($note)"
 
           # ---- 第二层：正式分卷 ----
           Get-ChildItem "$pkg.outer.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
-          $out = & $sz a -t7z -mx=0 -y "-v${volBytes}b" "$pkg.outer.7z" "$pkg.7z" 2>&1 | Out-String
+          $out = & $sz a -t7z -mx=0 -y $volArg "$pkg.outer.7z" "$pkg.7z" 2>&1 | Out-String
           if ($LASTEXITCODE -ge 2) { Write-Host $out; throw "split 7z failed (exit=$LASTEXITCODE)" }
 
           # 防火墙只放行 .7z -> 给每个 .001/.002 追加一层 .7z
