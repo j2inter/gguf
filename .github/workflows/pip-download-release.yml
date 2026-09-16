@@ -110,6 +110,11 @@ jobs:
       - name: Compress + split
         shell: pwsh
         run: |
+          # 强制 PowerShell 用现代 arg passing 模式，避免 Windows 上 `-mx=0` 这种带 `=` 参数被
+          # 隐式 quote 成 `"-mx=0"` 传给 7z 然后 7z 解析失败 fallback 到默认压缩级别（这就是
+          # 用户报告 Method=LZMA2:18 而不是 Store 的根因）
+          $PSNativeCommandArgumentPassing = 'Standard'
+
           $pkg  = "${{ steps.vars.outputs.pkg }}"
           $sz   = "C:\Program Files\7-Zip\7z.exe"
           $volMB = 0
@@ -117,32 +122,44 @@ jobs:
             throw "volume_size_mb 必须是正整数（收到 '${{ inputs.volume_size_mb }}'）"
           }
 
-          # ---- 第一层：把 ./download 压成单 .7z（mx=0 仅存储，最快）----
+          function Invoke-7z {
+            param([string[]]$Arguments, [string]$Label)
+            $cmdLine = "`"$sz`" " + ($Arguments | ForEach-Object { "`"$_`"" }) -join ' '
+            Write-Host "[$Label] $cmdLine"
+            $o = & $sz @Arguments 2>&1 | Out-String
+            $c = $LASTEXITCODE
+            Write-Host "[$Label] exit=$c"
+            Write-Host $o
+            if ($c -ge 2) { throw "$Label failed (exit=$c)" }
+            if ($c -eq 1) { Write-Host "::warning::[$Label] 7z returned warnings (exit=1)" }
+            return $o
+          }
+
+          # ---- 第一层：把 ./download 压成单 .7z (-mx0 store, 最快) ----
           if (Test-Path "$pkg.7z") { Remove-Item -Force "$pkg.7z" }
           $srcDir = ".\download"
           $hasFiles = (Test-Path $srcDir) -and ((Get-ChildItem $srcDir -Recurse -File).Count -gt 0)
           if ($hasFiles) {
-            $input4sz = "$srcDir\*"
+            $srcArg = "$srcDir\*"
           } else {
             $payloads = Get-ChildItem -Recurse -Include '*.whl','*.tar.gz','*.zip','*.egg' -ErrorAction SilentlyContinue |
                         Where-Object { $_.FullName -notlike "*$pkg.7z*" }
             if (-not $payloads -or $payloads.Count -eq 0) { throw "no artifacts to compress" }
             $payloads | ForEach-Object { $_.FullName } | Set-Content -Encoding ASCII _files.txt
-            $input4sz = "@_files.txt"
+            $srcArg = "@_files.txt"
           }
-          $out = & $sz a -t7z -mx=0 -y "$pkg.7z" $input4sz 2>&1 | Out-String
-          if ($LASTEXITCODE -ge 2) { Write-Host $out; throw "first 7z failed (exit=$LASTEXITCODE)" }
+
+          Invoke-7z -Label 'inner' -Arguments @('a','-t7z','-mx0','-y',"$pkg.7z",$srcArg) | Out-Null
+
           $inner = [int64](Get-Item "$pkg.7z").Length
-          if ($inner -le 64) { Write-Host $out; throw "first 7z is suspiciously small ($inner bytes)" }
-          Write-Host "Inner 7z: $inner bytes ($([math]::Round($inner/1MB,2)) MB)"
+          if ($inner -le 64) { throw "inner 7z is suspiciously small ($inner bytes)" }
+          Write-Host "Inner 7z size: $inner bytes ($([math]::Round($inner/1MB,2)) MB)"
+
+          # 诊断：列出 inner 实际内容（应该看到 wheels / 下载文件）
+          Write-Host "---- 7z l $pkg.7z ----"
+          & $sz l "$pkg.7z"
 
           # ---- 分卷大小决策（无 probe，按用户授权"不要求等大"）----
-          # outer = inner + ~200B（7z 容器 header 开销）；留 4KB 安全余量
-          # 公式：
-          #  - 用户值能切 ≥2 卷（按 inner 保守估算）  -> 直接用 -v{userMB}m
-          #  - 否则                                   -> vol = ceil((inner + 4096) / 2) 字节，强制 2 卷
-          # 数学保证（inner > 4KB）：2*vol = inner + 4096 > outer ⇒ 不超过 2 卷；
-          #                           vol = inner/2 + 2048 < outer ⇒ 至少 2 卷
           $userVolBytes = [int64]$volMB * 1MB
           $partsIfUser  = [math]::Ceiling($inner / $userVolBytes)
           if ($partsIfUser -ge 2) {
@@ -157,10 +174,22 @@ jobs:
             Write-Host "Auto-shrink: 用户 ${volMB}MB -> ${volBytes} bytes (强制 2 卷，第二卷会略小)"
           }
 
-          # ---- 第二层：正式分卷 ----
+          # ---- 第二层：分卷压缩 (input 只有一个文件: $pkg.7z) ----
           Get-ChildItem "$pkg.outer.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
-          $out = & $sz a -t7z -mx=0 -y $volArg "$pkg.outer.7z" "$pkg.7z" 2>&1 | Out-String
-          if ($LASTEXITCODE -ge 2) { Write-Host $out; throw "split 7z failed (exit=$LASTEXITCODE)" }
+          Invoke-7z -Label 'outer' -Arguments @('a','-t7z','-mx0','-y',$volArg,"$pkg.outer.7z","$pkg.7z") | Out-Null
+
+          # 诊断：列出 outer 第一卷的实际内容
+          # 期望: 恰好 1 个条目 "$pkg.7z"；如果是 wheels 那就是 source 给错了
+          Write-Host "---- 7z l $pkg.outer.7z.001 ----"
+          $listing = & $sz l "$pkg.outer.7z.001" 2>&1 | Out-String
+          Write-Host $listing
+          $expectedEntry = "$pkg.7z"
+          if ($listing -notmatch [regex]::Escape($expectedEntry)) {
+            throw "outer archive does NOT contain expected entry '$expectedEntry'. See listing above."
+          }
+          if ($listing -match '\.whl' -or $listing -match '\.tar\.gz') {
+            throw "outer archive contains raw wheels/sdists instead of the inner .7z. Source arg wrong."
+          }
 
           # 防火墙只放行 .7z -> 给每个 .001/.002 追加一层 .7z
           Get-ChildItem "$pkg.outer.7z.*" | Where-Object { $_.Name -notlike '*.7z.7z' } | ForEach-Object {
