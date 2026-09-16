@@ -1,10 +1,5 @@
 name: "📦 Download & Release"
 
-# 同 source 并发触发时排队，不互相 cancel
-concurrency:
-  group: ${{ github.workflow }}-${{ inputs.source }}
-  cancel-in-progress: false
-
 on:
   workflow_dispatch:
     inputs:
