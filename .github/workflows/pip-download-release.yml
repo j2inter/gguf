@@ -1,5 +1,10 @@
 name: "📦 Download & Release"
 
+# 并行运行同一 source 时排队，不互相 cancel
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.source }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -22,37 +27,43 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 60    # 防止 hang 住的 curl/pip 吃掉 6 小时配额
 
     steps:
-      - uses: actions/checkout@v4
+      # 注意：刻意不要 actions/checkout —— 本 workflow 不读仓库代码，只生成产物，
+      # softprops/action-gh-release 也不依赖 checkout（用 GITHUB_TOKEN 走 API）。省 2-5 秒。
 
-      - name: Parse input
+      - name: Resolve params
         id: vars
         shell: pwsh
         run: |
           $src = "${{ inputs.source }}".Trim()
           if ([string]::IsNullOrWhiteSpace($src)) { throw "source is empty" }
 
-          # 去掉前缀 'pip download' / 'pip3 download' / 'python -m pip download'
-          $stripped = $src -replace '^\s*(python\s+-m\s+)?pip3?\s+download\s+', ''
-
           # 模式识别：URL 以 http:// 或 https:// 开头
-          if ($src -match '^\s*https?://') { $mode = 'url' } else { $mode = 'pip' }
+          $mode = if ($src -match '^\s*https?://') { 'url' } else { 'pip' }
 
           # 自动命名
           if ($mode -eq 'url') {
-            try { $raw = [System.IO.Path]::GetFileNameWithoutExtension(([System.Uri]$src).AbsolutePath) }
-            catch { $raw = '' }
+            $raw = ''
+            try {
+              $uri = [System.Uri]$src
+              $raw = [System.IO.Path]::GetFileNameWithoutExtension($uri.AbsolutePath)
+            } catch {
+              Write-Host "::warning::URI 解析失败: $_; 将使用 fallback 名"
+            }
           } else {
-            # 取第一个非 flag、非选项值的 token
+            # 去掉前缀 'pip download' / 'pip3 download' / 'python -m pip download'
+            $stripped = $src -replace '^\s*(python\s+-m\s+)?pip3?\s+download\s+', ''
+            # 取第一个非 flag、非选项值的 token 作为名字
             $tokens = $stripped -split '\s+' | Where-Object { $_ -and -not $_.StartsWith('-') }
             $raw = $tokens | Select-Object -First 1
-            # 去掉 version specifier: requests==2.0 -> requests
+            # 剥掉 version specifier: requests==2.0 -> requests, foo[extra] -> foo
             if ($raw) { $raw = ($raw -split '[=<>!~\[]')[0] }
           }
           if ([string]::IsNullOrWhiteSpace($raw)) { $raw = 'download' }
 
-          # 文件名安全化
+          # 文件名安全化（保留 a-zA-Z0-9_.- 其余替换为 -）
           $pkg = ($raw -replace '[^a-zA-Z0-9_.-]', '-').Trim('-._')
           if ($pkg.Length -gt 80) { $pkg = $pkg.Substring(0, 80).Trim('-._') }
           if ([string]::IsNullOrWhiteSpace($pkg)) { $pkg = 'download' }
@@ -62,14 +73,12 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "$pkg-$stamp" }
 
           Write-Host "Mode      : $mode"
-          Write-Host "Stripped  : $stripped"
           Write-Host "Pkg name  : $pkg"
           Write-Host "Tag name  : $tag"
 
-          "mode=$mode"     | Add-Content $env:GITHUB_OUTPUT
-          "stripped=$stripped" | Add-Content $env:GITHUB_OUTPUT
-          "pkg=$pkg"       | Add-Content $env:GITHUB_OUTPUT
-          "tag=$tag"       | Add-Content $env:GITHUB_OUTPUT
+          "mode=$mode" | Add-Content $env:GITHUB_OUTPUT
+          "pkg=$pkg"   | Add-Content $env:GITHUB_OUTPUT
+          "tag=$tag"   | Add-Content $env:GITHUB_OUTPUT
 
       - uses: actions/setup-python@v5
         if: steps.vars.outputs.mode == 'pip'
@@ -80,39 +89,88 @@ jobs:
         if: steps.vars.outputs.mode == 'pip'
         shell: pwsh
         run: |
-          $args = "${{ steps.vars.outputs.stripped }}"
-          if ([string]::IsNullOrWhiteSpace($args)) { throw "no pip args after stripping 'pip download'" }
+          # $args 是 PowerShell 自动变量（脚本未具名参数数组），不要覆盖。改名为 $pipArgs。
+          $pipArgs = "${{ inputs.source }}".Trim()
+          if ([string]::IsNullOrWhiteSpace($pipArgs)) { throw "source is empty" }
+
+          # 剥前缀，再剥用户自带的 -d/--dest（路径不可预测；本 workflow 一律落到 ./download）
+          $pipArgs = $pipArgs -replace '^\s*(python\s+-m\s+)?pip3?\s+download\s+', ''
+          $hadDest = $pipArgs -match '(^|\s)(-d|--dest)(\s|=)'
+          if ($hadDest) {
+            Write-Host "::warning::detected -d/--dest in your pip_args; it will be stripped and replaced with '-d download' for predictable output location"
+            $pipArgs = $pipArgs -replace '(^|\s)(-d|--dest)(\s+[^\s]+|=[^\s]+)', ' '
+          }
+          $pipArgs = $pipArgs.Trim()
+          if ([string]::IsNullOrWhiteSpace($pipArgs)) { throw "no pip args after stripping 'pip download' prefix" }
+
           New-Item -ItemType Directory -Force download | Out-Null
-          $hasDest = $args -match '(^|\s)(-d|--dest)(\s|=)'
-          $cmd = if ($hasDest) { "python -m pip download $args" } else { "python -m pip download $args -d download" }
-          Write-Host "Invoking: $cmd"
-          python -m pip install --upgrade pip
-          Invoke-Expression $cmd
+
+          # 用 array splat 调用 python，不再 Invoke-Expression（避免 PowerShell 对引号/反引号/$ 的二次解析）
+          $argArr = @('-m', 'pip', 'download') + ($pipArgs -split '\s+' | Where-Object { $_ }) + @('-d', 'download')
+          Write-Host "Invoking: python $($argArr -join ' ')"
+          & python @argArr
           if ($LASTEXITCODE -ne 0) { throw "pip download failed (exit=$LASTEXITCODE)" }
-          $found = Get-ChildItem -Recurse -Include '*.whl','*.tar.gz','*.zip','*.egg' -ErrorAction SilentlyContinue
-          if (-not $found -or $found.Count -eq 0) { throw "pip download produced no artifacts" }
-          Write-Host "✅ $($found.Count) artifact(s), total $([math]::Round(($found | Measure-Object Length -Sum).Sum/1MB,2)) MB"
+
+          $found = @(Get-ChildItem 'download' -Recurse -File -ErrorAction SilentlyContinue)
+          if ($found.Count -eq 0) { throw "pip download produced no artifacts under ./download/" }
+          $totalMB = [math]::Round(($found | Measure-Object Length -Sum).Sum / 1MB, 2)
+          Write-Host "✅ $($found.Count) artifact(s), total $totalMB MB"
+          $found | Select-Object Name, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}
 
       - name: Download (url)
         if: steps.vars.outputs.mode == 'url'
         shell: pwsh
         run: |
           $url = "${{ inputs.source }}".Trim()
+          if ([string]::IsNullOrWhiteSpace($url)) { throw "source is empty" }
           New-Item -ItemType Directory -Force download | Out-Null
-          $name = [System.IO.Path]::GetFileName(([System.Uri]$url).AbsolutePath)
+
+          # 从 URL 取文件名
+          $uri = [System.Uri]$url
+          $name = [System.IO.Path]::GetFileName($uri.AbsolutePath)
           if ([string]::IsNullOrWhiteSpace($name)) { $name = "payload-$(Get-Date -Format yyyyMMddHHmmss).bin" }
+          # 文件名安全化（防止 URL 路径里塞 ../ 或其他奇怪字符）
+          $name = ($name -replace '[^a-zA-Z0-9_.+-]', '_')
+          $dest = "download\$name"
+
           Write-Host "GET $url"
-          Write-Host "-> download\$name"
-          $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest -Uri $url -OutFile "download\$name" -UseBasicParsing
-          Get-ChildItem download | Select-Object Name, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}
+          Write-Host "-> $dest"
+
+          # 用 curl.exe（Windows 10+ 自带，比 Invoke-WebRequest 在 GB 级文件上快 5-10 倍）
+          # --fail: HTTP >=400 时 exit 非 0
+          # --retry 3 + --retry-delay 2: 网络抖动时自动重试
+          # --connect-timeout 30 / --max-time 3600: 防止 hang
+          # -L: 跟随重定向
+          $curlArgs = @('-sSL', '--fail', '--retry', '3', '--retry-delay', '2',
+                        '--connect-timeout', '30', '--max-time', '3600',
+                        '-o', $dest, $url)
+          Write-Host "Invoking: curl.exe $($curlArgs -join ' ')"
+          $PSNativeCommandArgumentPassing = 'Standard'
+          & curl.exe @curlArgs
+          if ($LASTEXITCODE -ne 0) { throw "curl failed (exit=$LASTEXITCODE)" }
+
+          # 下载完成校验：防止 server 200 OK 返回 HTML 错误页被当成 wheel
+          $file = Get-Item $dest
+          $size = [int64]$file.Length
+          Write-Host "Downloaded: $($file.Name) ($size bytes, $([math]::Round($size/1MB,2)) MB)"
+          if ($size -le 0) { throw "downloaded file is empty (0 bytes)" }
+          if ($size -lt 1KB) {
+            # 极小文件嗅探：取前 512 字节看是不是 HTML 错误页
+            $headBytes = Get-Content $dest -AsByteStream -TotalCount 512 -ErrorAction SilentlyContinue
+            if ($headBytes) {
+              $headText = [System.Text.Encoding]::UTF8.GetString($headBytes)
+              if ($headText -match '(?i)<!DOCTYPE\s+html|<html[\s>]|<title>.*(error|not found|403|404)') {
+                $preview = $headText.Substring(0, [math]::Min(300, $headText.Length)) -replace '\s+', ' '
+                throw "downloaded '$name' ($size B) looks like an HTML error page, not the requested file. Preview: $preview"
+              }
+            }
+          }
 
       - name: Compress + split
         shell: pwsh
         run: |
-          # 强制 PowerShell 用现代 arg passing 模式，避免 Windows 上 `-mx=0` 这种带 `=` 参数被
-          # 隐式 quote 成 `"-mx=0"` 传给 7z 然后 7z 解析失败 fallback 到默认压缩级别（这就是
-          # 用户报告 Method=LZMA2:18 而不是 Store 的根因）
+          # 强制现代 arg passing：避免 Windows 默认 Legacy 模式把 `-mx=0` 这种带 = 的 arg
+          # 隐式 quote 后 7z 解析不出来 fallback 到默认压缩级别
           $PSNativeCommandArgumentPassing = 'Standard'
 
           $pkg  = "${{ steps.vars.outputs.pkg }}"
@@ -124,7 +182,9 @@ jobs:
 
           function Invoke-7z {
             param([string[]]$Arguments, [string]$Label)
-            $cmdLine = "`"$sz`" " + ($Arguments | ForEach-Object { "`"$_`"" }) -join ' '
+            # 显式括号防止 PS 解析歧义：+ 优先级高于 -join
+            $quotedArgs = ($Arguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
+            $cmdLine = '"' + $sz + '" ' + $quotedArgs
             Write-Host "[$Label] $cmdLine"
             $o = & $sz @Arguments 2>&1 | Out-String
             $c = $LASTEXITCODE
@@ -132,35 +192,32 @@ jobs:
             Write-Host $o
             if ($c -ge 2) { throw "$Label failed (exit=$c)" }
             if ($c -eq 1) { Write-Host "::warning::[$Label] 7z returned warnings (exit=1)" }
-            return $o
           }
 
           # ---- 第一层：把 ./download 压成单 .zip (-tzip -mx0 store, 最快；用 zip 是因为
           #      Windows Explorer 原生支持，解压方拿到后双击就能开，不再被嵌套 archive 坑) ----
           if (Test-Path "$pkg.zip") { Remove-Item -Force "$pkg.zip" }
           $srcDir = ".\download"
-          $hasFiles = (Test-Path $srcDir) -and ((Get-ChildItem $srcDir -Recurse -File).Count -gt 0)
-          if ($hasFiles) {
-            $srcArg = "$srcDir\*"
-          } else {
-            $payloads = Get-ChildItem -Recurse -Include '*.whl','*.tar.gz','*.zip','*.egg' -ErrorAction SilentlyContinue |
-                        Where-Object { $_.FullName -notlike "*$pkg.zip*" }
-            if (-not $payloads -or $payloads.Count -eq 0) { throw "no artifacts to compress" }
-            $payloads | ForEach-Object { $_.FullName } | Set-Content -Encoding ASCII _files.txt
-            $srcArg = "@_files.txt"
-          }
+          if (-not (Test-Path $srcDir)) { throw "$srcDir 不存在；前一步下载没产出" }
+          $srcFiles = @(Get-ChildItem $srcDir -Recurse -File)
+          if ($srcFiles.Count -eq 0) { throw "$srcDir 是空目录；前一步下载没产出" }
+          $srcArg = "$srcDir\*"
 
-          Invoke-7z -Label 'inner' -Arguments @('a','-tzip','-mx0','-y',"$pkg.zip",$srcArg) | Out-Null
+          Invoke-7z -Label 'inner' -Arguments @('a', '-tzip', '-mx0', '-y', "$pkg.zip", $srcArg)
 
           $inner = [int64](Get-Item "$pkg.zip").Length
           if ($inner -le 64) { throw "inner zip is suspiciously small ($inner bytes)" }
           Write-Host "Inner zip size: $inner bytes ($([math]::Round($inner/1MB,2)) MB)"
 
-          # 诊断：列出 inner 实际内容（应该看到 wheels / 下载文件）
+          # 诊断：列出 inner 实际内容（应看到 wheels / 下载文件）
           Write-Host "---- 7z l $pkg.zip ----"
           & $sz l "$pkg.zip"
 
           # ---- 分卷大小决策（无 probe，按用户授权"不要求等大"）----
+          # outer = inner + ~150B（7z 容器 header 开销）；4KB buffer 覆盖 overhead + 边界
+          # 数学保证（inner > 4KB）：
+          #   2*vol = inner + 4096 >= outer  ⇒ 不超过 2 卷
+          #   vol = inner/2 + 2048 < outer   ⇒ 至少 2 卷
           $userVolBytes = [int64]$volMB * 1MB
           $partsIfUser  = [math]::Ceiling($inner / $userVolBytes)
           if ($partsIfUser -ge 2) {
@@ -176,24 +233,35 @@ jobs:
           }
 
           # ---- 第二层：分卷压缩 (input 只有一个文件: $pkg.zip) ----
-          Get-ChildItem "$pkg.outer.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
-          Invoke-7z -Label 'outer' -Arguments @('a','-t7z','-mx0','-y',$volArg,"$pkg.outer.7z","$pkg.zip") | Out-Null
+          # 收紧 cleanup glob，避免误删同前缀但无关的文件
+          @("$pkg.outer.7z", "$pkg.outer.7z.[0-9]*", "$pkg.outer.7z.[0-9]*.7z") | ForEach-Object {
+            Get-ChildItem $_ -ErrorAction SilentlyContinue | Remove-Item -Force
+          }
+          Invoke-7z -Label 'outer' -Arguments @('a', '-t7z', '-mx0', '-y', $volArg, "$pkg.outer.7z", "$pkg.zip")
 
-          # 诊断：列出 outer 第一卷的实际内容
-          # 期望: 恰好 1 个条目 "$pkg.zip"；如果是 wheels 那就是 source 给错了
+          # 诊断 + ASSERT：outer 必须恰好包含 1 个条目 = $pkg.zip
           Write-Host "---- 7z l $pkg.outer.7z.001 ----"
-          $listing = & $sz l "$pkg.outer.7z.001" 2>&1 | Out-String
+          $listing = (& $sz l "$pkg.outer.7z.001" 2>&1) | Out-String
           Write-Host $listing
+
+          # ASSERT 1: listing 应包含 inner 文件名
           $expectedEntry = "$pkg.zip"
           if ($listing -notmatch [regex]::Escape($expectedEntry)) {
             throw "outer archive does NOT contain expected entry '$expectedEntry'. See listing above."
           }
-          if ($listing -match '\.whl' -or $listing -match '\.tar\.gz') {
-            throw "outer archive contains raw wheels/sdists instead of the inner .zip. Source arg wrong."
+          # ASSERT 2: entry 行（以日期开头）只能是 1 行，且不能是 raw wheel/sdist
+          $entryLines = @($listing -split "`r?`n" | Where-Object { $_ -match '^\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s' })
+          if ($entryLines.Count -ne 1) {
+            $joined = $entryLines -join "`n"
+            throw "outer archive should have exactly 1 entry but has $($entryLines.Count):`n$joined"
+          }
+          if ($entryLines[0] -match '\.(whl|tar\.gz|egg)\b') {
+            throw "outer archive's single entry looks like a raw wheel/sdist, not the inner zip: $($entryLines[0])"
           }
 
           # 防火墙只放行 .7z -> 给每个 .001/.002 追加一层 .7z
-          Get-ChildItem "$pkg.outer.7z.*" | Where-Object { $_.Name -notlike '*.7z.7z' } | ForEach-Object {
+          # 用 @(...) 强制 materialize 枚举结果，避免边遍历边 rename 的潜在问题
+          @(Get-ChildItem "$pkg.outer.7z.[0-9]*") | Where-Object { $_.Name -notlike '*.7z.7z' } | ForEach-Object {
             Rename-Item $_.FullName -NewName "$($_.Name).7z"
           }
 
@@ -201,7 +269,7 @@ jobs:
           Remove-Item -Force "$pkg.zip"
 
           Write-Host "---- final volumes ----"
-          Get-ChildItem "$pkg.outer.7z.*.7z" | Select-Object Name, Length, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}
+          Get-ChildItem "$pkg.outer.7z.[0-9]*.7z" | Select-Object Name, Length, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
