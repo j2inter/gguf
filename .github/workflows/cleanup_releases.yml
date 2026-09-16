@@ -16,23 +16,28 @@ jobs:
           fetch-depth: 0 # 獲取完整標籤信息
 
       - name: 📊 [2/4] 資源普查：掃描當前 Release 與 Tag
+        id: scan
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "==== [SCANNING RESOURCES] ===="
           # 統計遠端真正存在的資源
           RELEASE_COUNT=$(gh release list --limit 1000 | wc -l)
-          TAG_COUNT=$(git ls-remote --tags origin | grep -v '\^{}' | wc -l)
-          
+          # 用 sed 提取 refs/tags/<name>，能正確處理含 "/" 的 tag（如 v1.0/stable）
+          TAG_COUNT=$(git ls-remote --tags origin | sed -nE 's|^.*\s+refs/tags/([^^\^]+).*$|\1|p' | grep -v '\^{}$' | sort -u | wc -l)
+
           echo "📦 當前 Release 總數: $RELEASE_COUNT"
           echo "🏷️ 當前 Tag 總數: $TAG_COUNT"
-          
+
           if [ "$TAG_COUNT" -eq 0 ] && [ "$RELEASE_COUNT" -eq 0 ]; then
-            echo "✅ 倉庫已經非常乾淨，任務提前結束。"
-            exit 0
+            echo "✅ 倉庫已經非常乾淨，跳過後續清理步驟。"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
       - name: 💣 [3/4] 執行物理刪除：清空所有 Release
+        if: steps.scan.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -40,36 +45,39 @@ jobs:
           echo "==== [WIPEOUT START] ===="
           # 獲取所有 Release 標籤名
           RELEASES=$(gh release list --limit 1000 --json tagName --jq '.[].tagName')
-          
+
           if [ -z "$RELEASES" ]; then
             echo "💡 未發現任何 Release。"
           else
-            for tag in $RELEASES; do
+            while IFS= read -r tag; do
+              [ -z "$tag" ] && continue
               echo "▶️ 正在抹除 Release：$tag ..."
               # --cleanup-tag 會同步刪除對應的 Git Tag
               gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag || echo "⚠️ Release $tag 刪除跳過"
-            done
+            done <<< "$RELEASES"
           fi
 
       - name: 🧹 [4/4] 深度清理：掃除殘留孤立 Tag
+        if: steps.scan.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "==== [FINAL SWEEP] ===="
-          # 直接從遠端查詢實時 Tag 列表，避免「幽靈標籤」
-          REMOTE_TAGS=$(git ls-remote --tags origin | awk -F/ '{print $3}' | grep -v '\^{}')
-          
-          if [ -z "$REMOTE_TAGS" ]; then
+          # 直接從遠端查詢實時 Tag 列表，避免「幽靈標籤」；正確處理含 "/" 的 tag 名
+          mapfile -t REMOTE_TAGS < <(git ls-remote --tags origin | sed -nE 's|^.*\s+refs/tags/([^^\^]+).*$|\1|p' | grep -v '\^{}$' | sort -u)
+
+          if [ "${#REMOTE_TAGS[@]}" -eq 0 ]; then
             echo "✅ 遠端已無任何殘留 Tag。"
           else
-            for rtag in $REMOTE_TAGS; do
+            for rtag in "${REMOTE_TAGS[@]}"; do
               echo "🗑️ 正在刪除殘留 Tag：$rtag ..."
               # 雙重保險：git push 失敗則嘗試 API，API 報 422 則優雅跳過
-              git push origin --delete "$rtag" 2>/dev/null || \
-              gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$rtag" --silent || \
-              echo "💡 $rtag 已不存在，跳過。"
+              # 注意：含 "/" 的 tag 在 API 路徑中需要 URL 編碼，但 git push --delete 直接生效，优先它
+              git push origin --delete "refs/tags/$rtag" 2>/dev/null \
+                || gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$rtag" --silent \
+                || echo "💡 $rtag 已不存在，跳過。"
             done
           fi
-          
+
           echo -e "\n==== [🎉 CLEANUP COMPLETE] ===="
           echo "倉庫已恢復至初始乾淨狀態。"

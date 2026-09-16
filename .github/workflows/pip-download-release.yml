@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       pip_args:
-        description: 'pip download 的参数（例如：numpy pandas -d ./pkgs --platform win_amd64 --python-version 312 --only-binary=:all:）'
+        description: 'pip download 后面的所有参数。支持 --index-url/-i、--extra-index-url、--find-links/-f、--platform、--python-version、--only-binary、--no-deps 等任意 pip 选项；若未指定 -d/--dest 则自动写入 ./download'
         required: true
         default: 'requests'
+      pip_extra:
+        description: '可选：拼到末尾的额外参数（如：-i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com）'
+        required: false
+        default: ''
       pkg_name:
         description: '产物名称（用于压缩包和 Release 文件名，不含扩展名）'
         required: false
@@ -52,11 +56,29 @@ jobs:
       - name: pip download
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path download | Out-Null
+          $args1 = "${{ inputs.pip_args }}"
+          $args2 = "${{ inputs.pip_extra }}"
+          $dest  = "download"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+          # 若用户已自带 -d / --dest / -d=... / --dest=...，则不重复注入
+          $hasDest = $args1 -match '(^|\s)(-d|--dest)(\s|=)' -or $args2 -match '(^|\s)(-d|--dest)(\s|=)'
+          $fullArgs = "$args1 $args2".Trim()
+          if (-not $hasDest) { $fullArgs = "$fullArgs -d $dest" }
+
+          Write-Host "==== pip download invocation ===="
+          Write-Host "python -m pip download $fullArgs"
+          Write-Host "================================"
+
           python -m pip install --upgrade pip
-          python -m pip download ${{ inputs.pip_args }} -d download
+          # 显式按 shell 词法分词后传 array，避开 PowerShell 对引号/反引号的二次解释
+          $argArray = $fullArgs -split '\s+' | Where-Object { $_ -ne '' }
+          & python -m pip download @argArray
+          if ($LASTEXITCODE -ne 0) { throw "pip download failed (exit=$LASTEXITCODE)" }
+
+          # 实际目录可能因用户指定 -d 而不在 ./download，扫一遍当前目录所有 *.whl / *.tar.gz
           Write-Host "---- downloaded files ----"
-          Get-ChildItem -Recurse download | Select-Object FullName, Length
+          Get-ChildItem -Recurse -Include '*.whl','*.tar.gz','*.zip','*.egg' | Select-Object FullName, Length
 
       - name: First compression (single .7z)
         shell: pwsh
@@ -65,13 +87,20 @@ jobs:
           $sz   = "C:\Program Files\7-Zip\7z.exe"
           $here = (Get-Location).Path
           $first = Join-Path $here "$pkg.7z"
-          $src   = Join-Path $here "download"
           Write-Host "PWD       : $here"
-          Write-Host "Source    : $src"
           Write-Host "Inner 7z  : $first"
-          if (-not (Test-Path $src)) { throw "source dir not found: $src" }
+
+          # 收集 pip 产物：可能落地点是 ./download，也可能是用户自定义 -d 路径
+          $payloads = Get-ChildItem -Recurse -Include '*.whl','*.tar.gz','*.zip','*.egg' -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -notlike "$first*" }
+          if (-not $payloads -or $payloads.Count -eq 0) { throw "no pip artifacts (*.whl/*.tar.gz/*.zip/*.egg) found under $here" }
+          $manifest = Join-Path $here "_manifest.txt"
+          $payloads | ForEach-Object { "{0}`t{1}" -f $_.Length, $_.FullName } | Set-Content -Encoding utf8 $manifest
+          Write-Host "Found $($payloads.Count) artifact(s), total $([math]::Round(($payloads | Measure-Object Length -Sum).Sum/1MB,2)) MB"
+
           if (Test-Path $first) { Remove-Item -Force $first }
-          $out = & $sz a -t7z -mx=5 -y $first "$src\*" 2>&1 | Out-String
+          # @listfile 模式：把每个绝对路径写入清单交给 7z，避免命令行长度限制和 glob 解析歧义
+          $out = & $sz a -t7z -mx=5 -y $first "@$manifest" 2>&1 | Out-String
           $code = $LASTEXITCODE
           Write-Host "---- 7z output ----"
           Write-Host $out
