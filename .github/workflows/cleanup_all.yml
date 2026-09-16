@@ -1,0 +1,108 @@
+name: "🧹 Cleanup: Releases + Tags + Actions Runs"
+
+on:
+  workflow_dispatch:
+    inputs:
+      wipe_releases:
+        description: '清空所有 Release 和 Tag'
+        required: false
+        type: boolean
+        default: true
+      wipe_runs:
+        description: '清空所有 Actions 运行记录（含本次运行）'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  total-wipeout:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 [1/5] 检出仓库
+        if: ${{ inputs.wipe_releases }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 取完整 tag 信息
+
+      - name: 📊 [2/5] 资源普查
+        if: ${{ inputs.wipe_releases }}
+        id: scan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "==== [SCANNING RESOURCES] ===="
+          RELEASE_COUNT=$(gh release list --limit 1000 | wc -l)
+          # 用 sed 提取 refs/tags/<name>，正确处理含 "/" 的 tag（如 v1.0/stable）
+          TAG_COUNT=$(git ls-remote --tags origin \
+                      | sed -nE 's|^.*[[:space:]]+refs/tags/([^^]+).*$|\1|p' \
+                      | grep -v '\^{}$' | sort -u | wc -l)
+
+          echo "📦 当前 Release 总数: $RELEASE_COUNT"
+          echo "🏷️  当前 Tag 总数:     $TAG_COUNT"
+
+          if [ "$TAG_COUNT" -eq 0 ] && [ "$RELEASE_COUNT" -eq 0 ]; then
+            echo "✅ 仓库已经干净，跳过 Release/Tag 清理步骤。"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 💣 [3/5] 清空所有 Release（同步删除对应 Tag）
+        if: ${{ inputs.wipe_releases && steps.scan.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "==== [WIPEOUT RELEASES] ===="
+          RELEASES=$(gh release list --limit 1000 --json tagName --jq '.[].tagName')
+
+          if [ -z "$RELEASES" ]; then
+            echo "💡 未发现任何 Release。"
+          else
+            # while-read 替代 for-in，避免 word-splitting 问题
+            while IFS= read -r tag; do
+              [ -z "$tag" ] && continue
+              echo "▶️ 正在抹除 Release：$tag"
+              gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag \
+                || echo "⚠️ Release $tag 删除跳过"
+            done <<< "$RELEASES"
+          fi
+
+      - name: 🧹 [4/5] 扫除残留孤立 Tag
+        if: ${{ inputs.wipe_releases && steps.scan.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "==== [FINAL TAG SWEEP] ===="
+          # 含 "/" 的 tag 名（v1.0/stable）必须用完整 ref 路径，否则 git push --delete 歧义
+          mapfile -t REMOTE_TAGS < <(
+            git ls-remote --tags origin \
+              | sed -nE 's|^.*[[:space:]]+refs/tags/([^^]+).*$|\1|p' \
+              | grep -v '\^{}$' | sort -u
+          )
+
+          if [ "${#REMOTE_TAGS[@]}" -eq 0 ]; then
+            echo "✅ 远端已无任何残留 Tag。"
+          else
+            for rtag in "${REMOTE_TAGS[@]}"; do
+              echo "🗑️ 正在删除残留 Tag：$rtag"
+              # git push --delete 优先（能正确处理含 / 的 tag）；失败回退到 API
+              git push origin --delete "refs/tags/$rtag" 2>/dev/null \
+                || gh api -X DELETE "repos/$REPO/git/refs/tags/$rtag" --silent \
+                || echo "💡 $rtag 已不存在，跳过。"
+            done
+          fi
+          echo "==== [🎉 RELEASE/TAG CLEANUP DONE] ===="
+
+      - name: 💥 [5/5] 删除所有 Actions 运行记录
+        if: ${{ inputs.wipe_runs }}
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          retain_days: 0
+          keep_minimum_runs: 0
