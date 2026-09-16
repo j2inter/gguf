@@ -135,29 +135,30 @@ jobs:
             return $o
           }
 
-          # ---- 第一层：把 ./download 压成单 .7z (-mx0 store, 最快) ----
-          if (Test-Path "$pkg.7z") { Remove-Item -Force "$pkg.7z" }
+          # ---- 第一层：把 ./download 压成单 .zip (-tzip -mx0 store, 最快；用 zip 是因为
+          #      Windows Explorer 原生支持，解压方拿到后双击就能开，不再被嵌套 archive 坑) ----
+          if (Test-Path "$pkg.zip") { Remove-Item -Force "$pkg.zip" }
           $srcDir = ".\download"
           $hasFiles = (Test-Path $srcDir) -and ((Get-ChildItem $srcDir -Recurse -File).Count -gt 0)
           if ($hasFiles) {
             $srcArg = "$srcDir\*"
           } else {
             $payloads = Get-ChildItem -Recurse -Include '*.whl','*.tar.gz','*.zip','*.egg' -ErrorAction SilentlyContinue |
-                        Where-Object { $_.FullName -notlike "*$pkg.7z*" }
+                        Where-Object { $_.FullName -notlike "*$pkg.zip*" }
             if (-not $payloads -or $payloads.Count -eq 0) { throw "no artifacts to compress" }
             $payloads | ForEach-Object { $_.FullName } | Set-Content -Encoding ASCII _files.txt
             $srcArg = "@_files.txt"
           }
 
-          Invoke-7z -Label 'inner' -Arguments @('a','-t7z','-mx0','-y',"$pkg.7z",$srcArg) | Out-Null
+          Invoke-7z -Label 'inner' -Arguments @('a','-tzip','-mx0','-y',"$pkg.zip",$srcArg) | Out-Null
 
-          $inner = [int64](Get-Item "$pkg.7z").Length
-          if ($inner -le 64) { throw "inner 7z is suspiciously small ($inner bytes)" }
-          Write-Host "Inner 7z size: $inner bytes ($([math]::Round($inner/1MB,2)) MB)"
+          $inner = [int64](Get-Item "$pkg.zip").Length
+          if ($inner -le 64) { throw "inner zip is suspiciously small ($inner bytes)" }
+          Write-Host "Inner zip size: $inner bytes ($([math]::Round($inner/1MB,2)) MB)"
 
           # 诊断：列出 inner 实际内容（应该看到 wheels / 下载文件）
-          Write-Host "---- 7z l $pkg.7z ----"
-          & $sz l "$pkg.7z"
+          Write-Host "---- 7z l $pkg.zip ----"
+          & $sz l "$pkg.zip"
 
           # ---- 分卷大小决策（无 probe，按用户授权"不要求等大"）----
           $userVolBytes = [int64]$volMB * 1MB
@@ -174,21 +175,21 @@ jobs:
             Write-Host "Auto-shrink: 用户 ${volMB}MB -> ${volBytes} bytes (强制 2 卷，第二卷会略小)"
           }
 
-          # ---- 第二层：分卷压缩 (input 只有一个文件: $pkg.7z) ----
+          # ---- 第二层：分卷压缩 (input 只有一个文件: $pkg.zip) ----
           Get-ChildItem "$pkg.outer.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
-          Invoke-7z -Label 'outer' -Arguments @('a','-t7z','-mx0','-y',$volArg,"$pkg.outer.7z","$pkg.7z") | Out-Null
+          Invoke-7z -Label 'outer' -Arguments @('a','-t7z','-mx0','-y',$volArg,"$pkg.outer.7z","$pkg.zip") | Out-Null
 
           # 诊断：列出 outer 第一卷的实际内容
-          # 期望: 恰好 1 个条目 "$pkg.7z"；如果是 wheels 那就是 source 给错了
+          # 期望: 恰好 1 个条目 "$pkg.zip"；如果是 wheels 那就是 source 给错了
           Write-Host "---- 7z l $pkg.outer.7z.001 ----"
           $listing = & $sz l "$pkg.outer.7z.001" 2>&1 | Out-String
           Write-Host $listing
-          $expectedEntry = "$pkg.7z"
+          $expectedEntry = "$pkg.zip"
           if ($listing -notmatch [regex]::Escape($expectedEntry)) {
             throw "outer archive does NOT contain expected entry '$expectedEntry'. See listing above."
           }
           if ($listing -match '\.whl' -or $listing -match '\.tar\.gz') {
-            throw "outer archive contains raw wheels/sdists instead of the inner .7z. Source arg wrong."
+            throw "outer archive contains raw wheels/sdists instead of the inner .zip. Source arg wrong."
           }
 
           # 防火墙只放行 .7z -> 给每个 .001/.002 追加一层 .7z
@@ -196,8 +197,8 @@ jobs:
             Rename-Item $_.FullName -NewName "$($_.Name).7z"
           }
 
-          # 删掉内层 .7z，避免 release 误上传
-          Remove-Item -Force "$pkg.7z"
+          # 删掉内层 .zip，避免 release 误上传
+          Remove-Item -Force "$pkg.zip"
 
           Write-Host "---- final volumes ----"
           Get-ChildItem "$pkg.outer.7z.*.7z" | Select-Object Name, Length, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}
