@@ -1,0 +1,98 @@
+name: Pip Download & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      pip_args:
+        description: 'pip download 的参数（例如：numpy pandas -d ./pkgs --platform win_amd64 --python-version 312 --only-binary=:all:）'
+        required: true
+        default: 'requests'
+      pkg_name:
+        description: '产物名称（用于压缩包和 Release 文件名，不含扩展名）'
+        required: false
+        default: 'pip-packages'
+      volume_size:
+        description: '第二次分卷压缩的单卷大小（例如 100M、500M、1G）'
+        required: false
+        default: '500M'
+      tag_name:
+        description: 'Release 的 tag 名称（留空则自动生成）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Resolve names
+        id: vars
+        shell: pwsh
+        run: |
+          $pkg = "${{ inputs.pkg_name }}"
+          if ([string]::IsNullOrWhiteSpace($pkg)) { $pkg = "pip-packages" }
+          $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+          $tag = "${{ inputs.tag_name }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "$pkg-$stamp" }
+          "pkg=$pkg" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "stamp=$stamp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: pip download
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path download | Out-Null
+          python -m pip install --upgrade pip
+          python -m pip download ${{ inputs.pip_args }} -d download
+          Write-Host "---- downloaded files ----"
+          Get-ChildItem -Recurse download | Select-Object FullName, Length
+
+      - name: First compression (single .7z)
+        shell: pwsh
+        run: |
+          $pkg = "${{ steps.vars.outputs.pkg }}"
+          $first = "$pkg.7z"
+          & "C:\Program Files\7-Zip\7z.exe" a -t7z -mx=5 $first "./download/*"
+          if ($LASTEXITCODE -ne 0) { throw "7z first archive failed" }
+          Get-Item $first | Select-Object Name, Length
+
+      - name: Second compression (split volumes)
+        shell: pwsh
+        run: |
+          $pkg = "${{ steps.vars.outputs.pkg }}"
+          $size = "${{ inputs.volume_size }}"
+          $first = "$pkg.7z"
+          & "C:\Program Files\7-Zip\7z.exe" a -t7z -mx=5 -v$size "$pkg.outer.7z" $first
+          if ($LASTEXITCODE -ne 0) { throw "7z split archive failed" }
+          Get-ChildItem "$pkg.outer.7z.*" | Select-Object Name, Length
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: ${{ steps.vars.outputs.pkg }} (${{ steps.vars.outputs.stamp }})
+          generate_release_notes: false
+          body: |
+            pip download 参数：
+            ```
+            ${{ inputs.pip_args }}
+            ```
+            - 第一次压缩：`${{ steps.vars.outputs.pkg }}.7z`（内含 `download/` 目录下所有 whl/tar.gz）
+            - 第二次压缩分卷：`${{ steps.vars.outputs.pkg }}.outer.7z.001`、`.002` …
+              解压：`7z x ${{ steps.vars.outputs.pkg }}.outer.7z.001`，得到内层 `${{ steps.vars.outputs.pkg }}.7z`，再次 `7z x` 即可。
+          files: |
+            ${{ steps.vars.outputs.pkg }}.7z
+            ${{ steps.vars.outputs.pkg }}.outer.7z.*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
