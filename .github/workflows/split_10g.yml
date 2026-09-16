@@ -33,6 +33,17 @@ jobs:
           echo "磁盘剩余: $(df -h / | awk 'NR==2 {print $4}')"
           echo "======================"
 
+      - name: 🧹 [1.5/6] 释放磁盘空间（10G 级别模型必备）
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
       - name: 🛠️ [2/6] 安装环境依赖 (Dependencies)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y aria2 -qq
@@ -43,15 +54,28 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           echo "正在获取官方最新预编译组件..."
-          gh release download --repo ggerganov/llama.cpp --pattern "*ubuntu-x64.tar.gz"
+          # 注意：上游已从 ggerganov/llama.cpp 迁至 ggml-org/llama.cpp（GitHub 当前仍 redirect，但显式新名更稳）
+          gh release download --repo ggml-org/llama.cpp --pattern "*ubuntu-x64.tar.gz"
+          shopt -s nullglob
+          TARBALLS=(*ubuntu-x64.tar.gz)
+          if [ ${#TARBALLS[@]} -eq 0 ]; then
+            echo "::error::未匹配到 *ubuntu-x64.tar.gz；上游 release 命名可能已改动。"
+            exit 1
+          fi
           mkdir -p llama_release
-          tar -xzf *ubuntu-x64.tar.gz -C llama_release
-          
-          # 自动寻址工具和库路径
-          echo "SPLIT_BIN=$(find ./llama_release -name "llama-gguf-split" | head -n 1)" >> $GITHUB_ENV
-          echo "LIB_DIR=$(dirname $(find ./llama_release -name "libllama-common.so*" | head -n 1))" >> $GITHUB_ENV
-          echo "✅ Tensor 引擎初始化成功"
+          tar -xzf "${TARBALLS[0]}" -C llama_release
+
+          SPLIT_BIN=$(find ./llama_release -name "llama-gguf-split" -type f | head -n 1)
+          LIB_FILE=$(find ./llama_release -name "libllama-common.so*" -type f | head -n 1)
+          if [ -z "$SPLIT_BIN" ]; then echo "::error::找不到 llama-gguf-split 二进制"; exit 1; fi
+          if [ -z "$LIB_FILE" ]; then echo "::error::找不到 libllama-common.so*"; exit 1; fi
+          chmod +x "$SPLIT_BIN"
+
+          echo "SPLIT_BIN=$SPLIT_BIN" >> $GITHUB_ENV
+          echo "LIB_DIR=$(dirname "$LIB_FILE")" >> $GITHUB_ENV
+          echo "✅ Tensor 引擎初始化成功: $SPLIT_BIN"
 
       - name: 📥 [4/6] 多线程极速下载 (High-Speed Download)
         run: |
@@ -70,85 +94,51 @@ jobs:
 
       - name: ✂️ [5/6] 执行分割任务 (Splitting)
         run: |
+          set -euo pipefail
           MB_SIZE="${{ github.event.inputs.split_size_mb }}"
+          if ! [[ "$MB_SIZE" =~ ^[0-9]+$ ]]; then
+            echo "::error::split_size_mb 必须是整数（收到 '$MB_SIZE'）"; exit 1
+          fi
           SPLIT_SIZE="${MB_SIZE}M"
           METHOD="${{ github.event.inputs.split_method }}"
-          
+
           echo "📋 正在按照 $SPLIT_SIZE 进行 $METHOD 分割..."
-          
+
           if [[ "$METHOD" == "Tensor" ]]; then
               echo "🧠 采用张量级分割技术 (Tensor-level)..."
-              export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${{ env.LIB_DIR }}
-              ${{ env.SPLIT_BIN }} --split --split-max-size "$SPLIT_SIZE" "$RAW_NAME" "$BASE_NAME"
+              # 用 env 变量并加引号，避免路径含空格/特殊字符
+              export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$LIB_DIR"
+              "$SPLIT_BIN" --split --split-max-size "$SPLIT_SIZE" "$RAW_NAME" "$BASE_NAME"
           else
               echo "⚔️ 采用暴力切割技术 (Byte-level) + 标准命名伪装..."
               FILE_SIZE=$(stat -c%s "$RAW_NAME")
               PART_SIZE_BYTES=$(( MB_SIZE * 1024 * 1024 ))
               TOTAL_PARTS=$(( (FILE_SIZE + PART_SIZE_BYTES - 1) / PART_SIZE_BYTES ))
-              
+              TOTAL_FMT=$(printf "%05d" "$TOTAL_PARTS")
+
               split -b "$SPLIT_SIZE" -d --suffix-length=5 "$RAW_NAME" "tmp_part_"
-              
+
               count=1
               for f in tmp_part_*; do
-                  IDX=$(printf "%05d" $count)
-                  TOTAL_FMT=$(printf "%05d" $TOTAL_PARTS)
+                  IDX=$(printf "%05d" "$count")
                   NEW_NAME="${BASE_NAME}-${IDX}-of-${TOTAL_FMT}.gguf"
                   mv "$f" "$NEW_NAME"
                   ((count++))
               done
           fi
-          
+
           rm -f "$RAW_NAME"
           echo "--------------------"
           echo "✅ 分割成功，清单如下:"
-          ls -lh *.gguf
-          
-          # 注册生成的文件到环境变量 (支持前 5 个分卷)
-          echo "FILE_P1=$(ls ${BASE_NAME}-00001-of-*.gguf 2>/dev/null | head -n 1)" >> $GITHUB_ENV
-          echo "FILE_P2=$(ls ${BASE_NAME}-00002-of-*.gguf 2>/dev/null | head -n 1)" >> $GITHUB_ENV
-          echo "FILE_P3=$(ls ${BASE_NAME}-00003-of-*.gguf 2>/dev/null | head -n 1)" >> $GITHUB_ENV
-          echo "FILE_P4=$(ls ${BASE_NAME}-00004-of-*.gguf 2>/dev/null | head -n 1)" >> $GITHUB_ENV
-          echo "FILE_P5=$(ls ${BASE_NAME}-00005-of-*.gguf 2>/dev/null | head -n 1)" >> $GITHUB_ENV
+          ls -lh ./*.gguf
 
-      - name: 📤 [6/6] 分卷独立上传 (Artifacts Upload)
-        run: echo "🚀 正在部署分卷，请在 Actions 页面查看下载项..."
-
-      - name: 上传分卷 1 ✂️
-        if: env.FILE_P1 != ''
+      - name: 📤 [6/6] 分卷统一上传 (Artifacts Upload)
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.FILE_P1 }}
-          path: ${{ env.FILE_P1 }}
-          archive: false
-
-      - name: 上传分卷 2 ✂️
-        if: env.FILE_P2 != ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.FILE_P2 }}
-          path: ${{ env.FILE_P2 }}
-          archive: false
-
-      - name: 上传分卷 3 ✂️
-        if: env.FILE_P3 != ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.FILE_P3 }}
-          path: ${{ env.FILE_P3 }}
-          archive: false
-
-      - name: 上传分卷 4 ✂️
-        if: env.FILE_P4 != ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.FILE_P4 }}
-          path: ${{ env.FILE_P4 }}
-          archive: false
-
-      - name: 上传分卷 5 ✂️
-        if: env.FILE_P5 != ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.FILE_P5 }}
-          path: ${{ env.FILE_P5 }}
-          archive: false
+          # 注意：v7 的 archive:false 限制只能上传单文件，多分卷必须用 archive:true（打成 zip）
+          name: ${{ env.BASE_NAME }}-parts
+          path: ${{ env.BASE_NAME }}-*.gguf
+          archive: true
+          compression-level: 0   # GGUF 已不可压，0 最快
+          retention-days: 7
+          if-no-files-found: error
