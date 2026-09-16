@@ -1,32 +1,16 @@
-name: "📦 Pip / URL Download & Release"
+name: "📦 Download & Release"
 
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'Mode'
+      source:
+        description: 'pip download 命令 或 URL'
         required: true
-        type: choice
-        default: 'pip'
-        options:
-          - pip
-          - url
-      pip_args:
-        description: 'pip 模式：pip download 后面的参数'
+        default: 'pip download requests'
+      volume_size_mb:
+        description: '分卷大小 (MB)，太小则自动调成至少 2 份'
         required: false
-        default: 'requests'
-      source_url:
-        description: 'url 模式：下载地址'
-        required: false
-        default: ''
-      pkg_name:
-        description: '产物名称前缀'
-        required: false
-        default: 'pip-packages'
-      volume_size:
-        description: '分卷大小（如 500M、1G）'
-        required: false
-        default: '500M'
+        default: '500'
       tag_name:
         description: 'Release tag（留空自动生成）'
         required: false
@@ -42,156 +26,149 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        if: inputs.mode == 'pip'
-        with:
-          python-version: '3.12'
-
-      - name: Resolve names
+      - name: Parse input
         id: vars
         shell: pwsh
         run: |
-          $pkg = "${{ inputs.pkg_name }}"
-          if ([string]::IsNullOrWhiteSpace($pkg)) { $pkg = "download" }
+          $src = "${{ inputs.source }}".Trim()
+          if ([string]::IsNullOrWhiteSpace($src)) { throw "source is empty" }
+
+          # 去掉前缀 'pip download' / 'pip3 download' / 'python -m pip download'
+          $stripped = $src -replace '^\s*(python\s+-m\s+)?pip3?\s+download\s+', ''
+
+          # 模式识别：URL 以 http:// 或 https:// 开头
+          if ($src -match '^\s*https?://') { $mode = 'url' } else { $mode = 'pip' }
+
+          # 自动命名
+          if ($mode -eq 'url') {
+            try { $raw = [System.IO.Path]::GetFileNameWithoutExtension(([System.Uri]$src).AbsolutePath) }
+            catch { $raw = '' }
+          } else {
+            # 取第一个非 flag、非选项值的 token
+            $tokens = $stripped -split '\s+' | Where-Object { $_ -and -not $_.StartsWith('-') }
+            $raw = $tokens | Select-Object -First 1
+            # 去掉 version specifier: requests==2.0 -> requests
+            if ($raw) { $raw = ($raw -split '[=<>!~\[]')[0] }
+          }
+          if ([string]::IsNullOrWhiteSpace($raw)) { $raw = 'download' }
+
+          # 文件名安全化
+          $pkg = ($raw -replace '[^a-zA-Z0-9_.-]', '-').Trim('-._')
+          if ($pkg.Length -gt 80) { $pkg = $pkg.Substring(0, 80).Trim('-._') }
+          if ([string]::IsNullOrWhiteSpace($pkg)) { $pkg = 'download' }
+
           $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
           $tag = "${{ inputs.tag_name }}"
           if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "$pkg-$stamp" }
-          "pkg=$pkg"   | Add-Content $env:GITHUB_OUTPUT
-          "tag=$tag"   | Add-Content $env:GITHUB_OUTPUT
-          "stamp=$stamp" | Add-Content $env:GITHUB_OUTPUT
+
+          Write-Host "Mode      : $mode"
+          Write-Host "Stripped  : $stripped"
+          Write-Host "Pkg name  : $pkg"
+          Write-Host "Tag name  : $tag"
+
+          "mode=$mode"     | Add-Content $env:GITHUB_OUTPUT
+          "stripped=$stripped" | Add-Content $env:GITHUB_OUTPUT
+          "pkg=$pkg"       | Add-Content $env:GITHUB_OUTPUT
+          "tag=$tag"       | Add-Content $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-python@v5
+        if: steps.vars.outputs.mode == 'pip'
+        with:
+          python-version: '3.12'
 
       - name: Download (pip)
-        if: inputs.mode == 'pip'
+        if: steps.vars.outputs.mode == 'pip'
         shell: pwsh
         run: |
-          $args = "${{ inputs.pip_args }}"
-          if ([string]::IsNullOrWhiteSpace($args)) { throw "pip_args is empty" }
-
-          # 用户若已自带 -d/--dest，就让 pip 走自己的路径，否则强制 -d download
+          $args = "${{ steps.vars.outputs.stripped }}"
+          if ([string]::IsNullOrWhiteSpace($args)) { throw "no pip args after stripping 'pip download'" }
           New-Item -ItemType Directory -Force download | Out-Null
           $hasDest = $args -match '(^|\s)(-d|--dest)(\s|=)'
           $cmd = if ($hasDest) { "python -m pip download $args" } else { "python -m pip download $args -d download" }
-          Write-Host "::group::Invoking: $cmd"
+          Write-Host "Invoking: $cmd"
           python -m pip install --upgrade pip
           Invoke-Expression $cmd
-          $code = $LASTEXITCODE
-          Write-Host "::endgroup::"
-          if ($code -ne 0) { throw "pip download failed (exit=$code)" }
-
-          # 预检查：必须真的产出文件，否则下面 7z 会静默生成 32 字节空档（PR #4 踩过的坑）
+          if ($LASTEXITCODE -ne 0) { throw "pip download failed (exit=$LASTEXITCODE)" }
           $found = Get-ChildItem -Recurse -Include '*.whl','*.tar.gz','*.zip','*.egg' -ErrorAction SilentlyContinue
-          if (-not $found -or $found.Count -eq 0) {
-            throw "pip download produced no artifacts (*.whl/*.tar.gz/*.zip/*.egg) under $(Get-Location). 检查上面的 pip 输出。"
-          }
-          Write-Host "✅ Found $($found.Count) artifact(s):"
-          $found | Select-Object FullName, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}
+          if (-not $found -or $found.Count -eq 0) { throw "pip download produced no artifacts" }
+          Write-Host "✅ $($found.Count) artifact(s), total $([math]::Round(($found | Measure-Object Length -Sum).Sum/1MB,2)) MB"
 
       - name: Download (url)
-        if: inputs.mode == 'url'
+        if: steps.vars.outputs.mode == 'url'
         shell: pwsh
         run: |
-          $url = "${{ inputs.source_url }}"
-          if ([string]::IsNullOrWhiteSpace($url)) { throw "source_url is empty" }
+          $url = "${{ inputs.source }}".Trim()
           New-Item -ItemType Directory -Force download | Out-Null
-          # 从 URL 取文件名；query string 截掉；取不到就用时间戳
           $name = [System.IO.Path]::GetFileName(([System.Uri]$url).AbsolutePath)
           if ([string]::IsNullOrWhiteSpace($name)) { $name = "payload-$(Get-Date -Format yyyyMMddHHmmss).bin" }
-          Write-Host "Downloading: $url"
-          Write-Host "Saving as  : download\$name"
-          $ProgressPreference = 'SilentlyContinue'   # 关进度条，IWR 在大文件时能快好几倍
+          Write-Host "GET $url"
+          Write-Host "-> download\$name"
+          $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest -Uri $url -OutFile "download\$name" -UseBasicParsing
           Get-ChildItem download | Select-Object Name, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}
 
-      - name: First compression (single .7z)
+      - name: Compress + split
         shell: pwsh
         run: |
-          $pkg = "${{ steps.vars.outputs.pkg }}"
-          $sz  = "C:\Program Files\7-Zip\7z.exe"
-          if (Test-Path "$pkg.7z") { Remove-Item -Force "$pkg.7z" }
+          $pkg  = "${{ steps.vars.outputs.pkg }}"
+          $sz   = "C:\Program Files\7-Zip\7z.exe"
+          $volMB = 0
+          if (-not [int]::TryParse("${{ inputs.volume_size_mb }}", [ref]$volMB) -or $volMB -le 0) {
+            throw "volume_size_mb 必须是正整数（收到 '${{ inputs.volume_size_mb }}'）"
+          }
 
-          # 输入选择：
-          #  - 若 ./download 非空 -> 用 ".\download\*" 通配（最常见路径）
-          #  - 若空（用户在 pip_args 里自带 -d /other/path）-> 全目录递归扫 *.whl/*.tar.gz/*.zip/*.egg 写 listfile
-          #    注意 7z @listfile 必须 **每行一个路径**，不要加 size 前缀（PR #4 的 bug 就是写成 "size\tpath" 导致 7z 全部当无效路径）
+          # ---- 第一层：把 ./download 压成单 .7z（mx=0 仅存储，最快）----
+          if (Test-Path "$pkg.7z") { Remove-Item -Force "$pkg.7z" }
           $srcDir = ".\download"
-          $hasFiles = (Test-Path $srcDir) -and ((Get-ChildItem $srcDir -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0)
+          $hasFiles = (Test-Path $srcDir) -and ((Get-ChildItem $srcDir -Recurse -File).Count -gt 0)
           if ($hasFiles) {
             $input4sz = "$srcDir\*"
-            Write-Host "Source mode : dir-glob ($srcDir)"
           } else {
             $payloads = Get-ChildItem -Recurse -Include '*.whl','*.tar.gz','*.zip','*.egg' -ErrorAction SilentlyContinue |
                         Where-Object { $_.FullName -notlike "*$pkg.7z*" }
             if (-not $payloads -or $payloads.Count -eq 0) { throw "no artifacts to compress" }
-            $list = "_files.txt"
-            $payloads | ForEach-Object { $_.FullName } | Set-Content -Encoding ASCII $list
-            $input4sz = "@$list"
-            Write-Host "Source mode : listfile ($list, $($payloads.Count) entries)"
+            $payloads | ForEach-Object { $_.FullName } | Set-Content -Encoding ASCII _files.txt
+            $input4sz = "@_files.txt"
+          }
+          $out = & $sz a -t7z -mx=0 -y "$pkg.7z" $input4sz 2>&1 | Out-String
+          if ($LASTEXITCODE -ge 2) { Write-Host $out; throw "first 7z failed (exit=$LASTEXITCODE)" }
+          $inner = (Get-Item "$pkg.7z").Length
+          if ($inner -le 64) { Write-Host $out; throw "first 7z is suspiciously small ($inner bytes)" }
+          Write-Host "Inner 7z: $([math]::Round($inner/1MB,2)) MB"
+
+          # ---- 分卷大小自校正：保证至少切成 2 份 ----
+          $innerMB = [math]::Ceiling($inner / 1MB)
+          $parts = [math]::Ceiling($innerMB / $volMB)
+          if ($parts -lt 2) {
+            $newVol = [math]::Max(1, [math]::Ceiling($innerMB / 2))
+            Write-Host "Volume size adjusted: ${volMB}MB -> ${newVol}MB (force >= 2 parts; inner=$innerMB MB)"
+            $volMB = $newVol
           }
 
-          $out = & $sz a -t7z -mx=5 -y "$pkg.7z" $input4sz 2>&1 | Out-String
-          $code = $LASTEXITCODE
-          Write-Host $out
-          Write-Host "exit code: $code"
-          if ($code -ge 2) { throw "first 7z failed (exit=$code)" }
-
-          # 兜底：32 字节是 7z 空 archive 的大小，说明实际上没压进任何东西（PR #4 静默踩坑）
-          $sz7 = (Get-Item "$pkg.7z").Length
-          if ($sz7 -le 64) {
-            throw "first 7z is suspiciously small ($sz7 bytes) -- nothing was actually archived. See 7z output above."
-          }
-          Get-Item "$pkg.7z" | Select-Object Name, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}
-
-      - name: Second compression (split volumes) + rename to *.7z
-        shell: pwsh
-        run: |
-          $pkg  = "${{ steps.vars.outputs.pkg }}"
-          $size = "${{ inputs.volume_size }}"
-          $sz   = "C:\Program Files\7-Zip\7z.exe"
+          # ---- 第二层：分卷压缩 + 重命名加 .7z 后缀 ----
           Get-ChildItem "$pkg.outer.7z*" -ErrorAction SilentlyContinue | Remove-Item -Force
+          $out = & $sz a -t7z -mx=0 -y -v"${volMB}m" "$pkg.outer.7z" "$pkg.7z" 2>&1 | Out-String
+          if ($LASTEXITCODE -ge 2) { Write-Host $out; throw "split 7z failed (exit=$LASTEXITCODE)" }
 
-          $out = & $sz a -t7z -mx=5 -y -v"$size" "$pkg.outer.7z" "$pkg.7z" 2>&1 | Out-String
-          $code = $LASTEXITCODE
-          Write-Host $out
-          Write-Host "exit code: $code"
-          if ($code -ge 2) { throw "split 7z failed (exit=$code)" }
-
-          # 防火墙只放行 .7z 后缀 -> 给每个分卷再追加一层 .7z
+          # 防火墙只放行 .7z -> 给每个 .001/.002 追加一层 .7z
           Get-ChildItem "$pkg.outer.7z.*" | Where-Object { $_.Name -notlike '*.7z.7z' } | ForEach-Object {
             Rename-Item $_.FullName -NewName "$($_.Name).7z"
           }
-          Write-Host "---- renamed volumes ----"
-          Get-ChildItem "$pkg.outer.7z.*" | Select-Object Name, Length
+          Write-Host "---- final volumes ----"
+          # 删掉内层 .7z，避免 release 误上传
+          Remove-Item -Force "$pkg.7z"
+          Get-ChildItem "$pkg.outer.7z.*.7z" | Select-Object Name, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
-          name: ${{ steps.vars.outputs.pkg }} (${{ steps.vars.outputs.stamp }})
           generate_release_notes: false
           body: |
-            Mode: `${{ inputs.mode }}`
             ```
-            ${{ inputs.mode == 'pip' && inputs.pip_args || inputs.source_url }}
-            ```
-
-            **下载后解压**（每个分卷末尾多了一层 `.7z` 用于绕过防火墙，先去掉再解）：
-
-            Windows PowerShell：
-            ```powershell
-            Get-ChildItem "${{ steps.vars.outputs.pkg }}.outer.7z.*.7z" |
-              Rename-Item -NewName { $_.Name -replace '\.7z$','' }
-            7z x "${{ steps.vars.outputs.pkg }}.outer.7z.001"
-            7z x "${{ steps.vars.outputs.pkg }}.7z"
-            ```
-
-            Linux / macOS：
-            ```bash
-            for f in ${{ steps.vars.outputs.pkg }}.outer.7z.*.7z; do mv "$f" "${f%.7z}"; done
-            7z x ${{ steps.vars.outputs.pkg }}.outer.7z.001
-            7z x ${{ steps.vars.outputs.pkg }}.7z
+            ${{ inputs.source }}
             ```
           files: |
-            ${{ steps.vars.outputs.pkg }}.7z
             ${{ steps.vars.outputs.pkg }}.outer.7z.*.7z
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
