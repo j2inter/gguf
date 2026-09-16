@@ -28,7 +28,7 @@ jobs:
         if: ${{ inputs.wipe_releases }}
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # 取完整 tag 信息
+          fetch-depth: 0
 
       - name: 📊 [2/5] 资源普查
         if: ${{ inputs.wipe_releases }}
@@ -37,45 +37,35 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          echo "==== [SCANNING RESOURCES] ===="
           RELEASE_COUNT=$(gh release list --limit 1000 | wc -l)
-          # 用 sed 提取 refs/tags/<name>，正确处理含 "/" 的 tag（如 v1.0/stable）
-          # 末尾的 ^{} 是 annotated tag 的 deref 别名，过滤掉避免重复计数
+          # sed 提取 refs/tags/<name>，正确处理含 "/" 的 tag（v1.0/stable）
+          # 末尾的 ^{} 是 annotated tag 的 deref 别名，需过滤
           TAG_COUNT=$(git ls-remote --tags origin \
                       | sed -nE 's|^.*[[:space:]]+refs/tags/([^^]+).*$|\1|p' \
                       | grep -v '\^{}$' | sort -u | wc -l)
-
-          echo "📦 当前 Release 总数: $RELEASE_COUNT"
-          echo "🏷️  当前 Tag 总数:     $TAG_COUNT"
-
+          echo "📦 Release: $RELEASE_COUNT,  🏷️ Tag: $TAG_COUNT"
           if [ "$TAG_COUNT" -eq 0 ] && [ "$RELEASE_COUNT" -eq 0 ]; then
-            echo "✅ 仓库已经干净，跳过 Release/Tag 清理步骤。"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 💣 [3/5] 清空所有 Release（同步删除对应 Tag）
+      - name: 💣 [3/5] 清空所有 Release（同步删 Tag）
         if: ${{ inputs.wipe_releases && steps.scan.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          echo "==== [WIPEOUT RELEASES] ===="
           RELEASES=$(gh release list --limit 1000 --json tagName --jq '.[].tagName')
-
-          if [ -z "$RELEASES" ]; then
-            echo "💡 未发现任何 Release。"
-          else
-            # while-read 替代 for-in，避免 word-splitting 问题
-            while IFS= read -r tag; do
-              [ -z "$tag" ] && continue
-              echo "▶️ 正在抹除 Release：$tag"
-              gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag \
-                || echo "⚠️ Release $tag 删除跳过"
-            done <<< "$RELEASES"
-          fi
+          [ -z "$RELEASES" ] && { echo "💡 无 Release"; exit 0; }
+          # while-read 替代 for-in，避免 word-splitting
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "▶️ $tag"
+            gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag \
+              || echo "⚠️ $tag 删除跳过"
+          done <<< "$RELEASES"
 
       - name: 🧹 [4/5] 扫除残留孤立 Tag
         if: ${{ inputs.wipe_releases && steps.scan.outputs.skip != 'true' }}
@@ -84,33 +74,23 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          echo "==== [FINAL TAG SWEEP] ===="
-          # 含 "/" 的 tag 名（v1.0/stable）必须用完整 ref 路径，否则 git push --delete 歧义
           mapfile -t REMOTE_TAGS < <(
             git ls-remote --tags origin \
               | sed -nE 's|^.*[[:space:]]+refs/tags/([^^]+).*$|\1|p' \
               | grep -v '\^{}$' | sort -u
           )
+          [ "${#REMOTE_TAGS[@]}" -eq 0 ] && { echo "✅ 无残留 Tag"; exit 0; }
+          for rtag in "${REMOTE_TAGS[@]}"; do
+            echo "🗑️ $rtag"
+            # 三重 fallback：git push -> gh api -> 跳过；临时关 errexit
+            set +e
+            git push origin --delete "refs/tags/$rtag" 2>/dev/null \
+              || gh api -X DELETE "repos/$REPO/git/refs/tags/$rtag" --silent \
+              || echo "💡 $rtag 已不存在"
+            set -e
+          done
 
-          if [ "${#REMOTE_TAGS[@]}" -eq 0 ]; then
-            echo "✅ 远端已无任何残留 Tag。"
-          else
-            for rtag in "${REMOTE_TAGS[@]}"; do
-              echo "🗑️ 正在删除残留 Tag：$rtag"
-              # git push --delete 优先（能正确处理含 / 的 tag）；失败回退到 API
-              # 双 || 链需要 set +e 临时关掉 errexit，否则 git push 失败会让整个 step 退出
-              set +e
-              git push origin --delete "refs/tags/$rtag" 2>/dev/null \
-                || gh api -X DELETE "repos/$REPO/git/refs/tags/$rtag" --silent \
-                || echo "💡 $rtag 已不存在，跳过。"
-              set -e
-            done
-          fi
-          echo "==== [🎉 RELEASE/TAG CLEANUP DONE] ===="
-
-      # SHA-pin 替代 @v2 移动 tag，避免上游被入侵后 force-push 投毒
-      # 这是 self-use 场景下唯一保留的"安全"加固，因为 delete-workflow-runs 拿到的是
-      # actions:write 权限，影响面比 content 改动更大
+      # SHA-pin：actions:write 权限被入侵会 silent 删光你全部 run history
       - name: 💥 [5/5] 删除所有 Actions 运行记录
         if: ${{ inputs.wipe_runs }}
         uses: Mattraks/delete-workflow-runs@0cf693bc9909e5e867ee8f27b813224ba862939c  # v2
