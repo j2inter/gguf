@@ -249,11 +249,18 @@ jobs:
           if ($listing -notmatch [regex]::Escape($expectedEntry)) {
             throw "outer archive does NOT contain expected entry '$expectedEntry'. See listing above."
           }
-          # ASSERT 2: entry 行（以日期开头）只能是 1 行，且不能是 raw wheel/sdist
-          $entryLines = @($listing -split "`r?`n" | Where-Object { $_ -match '^\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s' })
+          # ASSERT 2: entry 行（带 5 字符 Attr 列，如 '....A'）必须恰好 1 行
+          # 7z listing 里 summary 行（"N files" 总计）也以日期开头，但 Attr 列是空白；
+          # 用 [A-Z.]{5}\s 精确区分 entry vs summary，避免假阳性
+          $entryLines = @($listing -split "`r?`n" | Where-Object {
+            $_ -match '^\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+[A-Z.]{5}\s+\d+\s+\d+\s+\S'
+          })
           if ($entryLines.Count -ne 1) {
             $joined = $entryLines -join "`n"
             throw "outer archive should have exactly 1 entry but has $($entryLines.Count):`n$joined"
+          }
+          if ($entryLines[0] -notmatch [regex]::Escape($expectedEntry) + '\s*$') {
+            throw "outer archive's entry doesn't end with '$expectedEntry': $($entryLines[0])"
           }
           if ($entryLines[0] -match '\.(whl|tar\.gz|egg)\b') {
             throw "outer archive's single entry looks like a raw wheel/sdist, not the inner zip: $($entryLines[0])"
