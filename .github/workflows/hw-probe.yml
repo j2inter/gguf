@@ -1100,6 +1100,16 @@ jobs:
           try { Tbl 'RuntimeInformation.OSArchitecture' ([string][System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) } catch { Tbl 'RuntimeInformation.OSArchitecture' 'n/a' }
           Emit ''
           Emit ('> **结论**：架构 = ' + $archConclusion + '（PROCESSOR_ARCHITECTURE = ' + (NA $pa) + '）；HypervisorPresent = ' + $hyperVisor + '；VirtualizationFirmwareEnabled = ' + $virtFw)
+
+          # GitHub 的 pwsh 包装器在脚本结束后会执行 `exit $LASTEXITCODE`。
+          # 上面这些探测调用了 dotnet / choco / powershell.exe 等原生程序，最后一个原生命令
+          # 的非零退出码会把整个 step 判成失败 —— 即使所有输出都已成功写入
+          # （实测：05-software.md 已写到 13128 字节、日志正常，step 仍 exit 1）。
+          # 这是「尽力采集」型步骤，缺工具或工具返回非零都属正常，不该判失败。
+          if ($null -ne $LASTEXITCODE) {
+            Write-Host ("最后一个原生命令退出码: {0}（已忽略，探测输出照常写入）" -f $LASTEXITCODE)
+          }
+          exit 0
       - name: 🪟 Windows 硬件探测 · 02 内存（02-memory.md）
         if: runner.os == 'Windows'
         continue-on-error: true
@@ -1238,6 +1248,16 @@ jobs:
             if ($fsutilLines.Count -gt 0) { Emit ([string[]]$fsutilLines) } else { Emit ('n/a（fsutil 返回码 ' + $LASTEXITCODE + '）') }
           } catch { Emit ('n/a（' + $_.Exception.Message + '）') }
           Emit '```'
+
+          # GitHub 的 pwsh 包装器在脚本结束后会执行 `exit $LASTEXITCODE`。
+          # 上面这些探测调用了 dotnet / choco / powershell.exe 等原生程序，最后一个原生命令
+          # 的非零退出码会把整个 step 判成失败 —— 即使所有输出都已成功写入
+          # （实测：05-software.md 已写到 13128 字节、日志正常，step 仍 exit 1）。
+          # 这是「尽力采集」型步骤，缺工具或工具返回非零都属正常，不该判失败。
+          if ($null -ne $LASTEXITCODE) {
+            Write-Host ("最后一个原生命令退出码: {0}（已忽略，探测输出照常写入）" -f $LASTEXITCODE)
+          }
+          exit 0
       - name: 🪟 Windows 硬件探测 · 03 磁盘（03-disk.md）
         if: runner.os == 'Windows'
         continue-on-error: true
@@ -1446,6 +1466,16 @@ jobs:
           } catch {
             Tbl '关键结论' ('n/a（' + $_.Exception.Message + '）')
           }
+
+          # GitHub 的 pwsh 包装器在脚本结束后会执行 `exit $LASTEXITCODE`。
+          # 上面这些探测调用了 dotnet / choco / powershell.exe 等原生程序，最后一个原生命令
+          # 的非零退出码会把整个 step 判成失败 —— 即使所有输出都已成功写入
+          # （实测：05-software.md 已写到 13128 字节、日志正常，step 仍 exit 1）。
+          # 这是「尽力采集」型步骤，缺工具或工具返回非零都属正常，不该判失败。
+          if ($null -ne $LASTEXITCODE) {
+            Write-Host ("最后一个原生命令退出码: {0}（已忽略，探测输出照常写入）" -f $LASTEXITCODE)
+          }
+          exit 0
       - name: 🪟 Windows 硬件探测 · 04 GPU（04-gpu.md）
         if: runner.os == 'Windows'
         continue-on-error: true
@@ -1567,6 +1597,16 @@ jobs:
             Emit ('> **结论**：当前 runner 检测到 GPU 适配器：' + ($gpuNames -join '、') + '。')
             Emit '> 请以 nvidia-smi / 驱动信息进一步确认计算能力（标准托管 runner 通常不含 GPU，若此处列出非虚拟适配器请人工核实）。'
           }
+
+          # GitHub 的 pwsh 包装器在脚本结束后会执行 `exit $LASTEXITCODE`。
+          # 上面这些探测调用了 dotnet / choco / powershell.exe 等原生程序，最后一个原生命令
+          # 的非零退出码会把整个 step 判成失败 —— 即使所有输出都已成功写入
+          # （实测：05-software.md 已写到 13128 字节、日志正常，step 仍 exit 1）。
+          # 这是「尽力采集」型步骤，缺工具或工具返回非零都属正常，不该判失败。
+          if ($null -ne $LASTEXITCODE) {
+            Write-Host ("最后一个原生命令退出码: {0}（已忽略，探测输出照常写入）" -f $LASTEXITCODE)
+          }
+          exit 0
 
       - name: 🧰 探测软件环境（工具链版本）
         shell: bash
@@ -2039,6 +2079,16 @@ jobs:
 
           Write-Host "=== 05-software.md 已追加 Windows 专属小节 ==="
           (Get-Item -LiteralPath $f).Length
+
+          # GitHub 的 pwsh 包装器在脚本结束后会执行 `exit $LASTEXITCODE`。
+          # 上面这些探测调用了 dotnet / choco / powershell.exe 等原生程序，最后一个原生命令
+          # 的非零退出码会把整个 step 判成失败 —— 即使所有输出都已成功写入
+          # （实测：05-software.md 已写到 13128 字节、日志正常，step 仍 exit 1）。
+          # 这是「尽力采集」型步骤，缺工具或工具返回非零都属正常，不该判失败。
+          if ($null -ne $LASTEXITCODE) {
+            Write-Host ("最后一个原生命令退出码: {0}（已忽略，探测输出照常写入）" -f $LASTEXITCODE)
+          }
+          exit 0
       - name: 🏃 探测 Runner / 镜像环境
         shell: bash
         run: |
