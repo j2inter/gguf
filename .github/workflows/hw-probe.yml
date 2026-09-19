@@ -1,0 +1,2625 @@
+name: "🖥️ 硬件配置 / 性能 / 软件环境探测"
+
+# 跨 Linux / Windows / macOS 三类 GitHub 托管 runner 采集硬件配置、跑微基准、清点软件环境，
+# 每个平台产出完整 Markdown 报告 artifact，最后由 report job 合并成一张跨平台对比表写进 Run Summary。
+#
+# 公开仓库的标准 runner 分钟数免费无限量，可放心跑满矩阵。
+# 手动触发时可自定义 runner 标签，把 arm64 也纳入对比：
+#   ubuntu-latest,windows-latest,macos-latest,ubuntu-24.04-arm,windows-11-arm,macos-15-intel
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: '要探测的 runner 标签，逗号分隔（支持 arm64 / intel 机型，见 validate job）'
+        required: false
+        default: 'ubuntu-latest,windows-latest,macos-latest'
+      bench_seconds:
+        description: '每项基准测试的时间预算（秒）。越大越稳，也越慢'
+        required: false
+        default: '3'
+      disk_mb:
+        description: '磁盘基准测试文件大小 (MB)。实测 runner 底层卷有 144~320GB，但请留余量'
+        required: false
+        default: '1024'
+      bench_workers:
+        description: '多核基准的并行进程数，0 = 全部逻辑核'
+        required: false
+        default: '0'
+      probe_net:
+        description: '是否测试网络（DNS / TCP / TLS / HTTP 吞吐）'
+        required: false
+        type: boolean
+        default: true
+      native_bench:
+        description: '是否额外跑原生工具交叉验证（Linux/macOS sysbench，Windows 7z b）'
+        required: false
+        type: boolean
+        default: true
+      upload_artifacts:
+        description: '是否上传每平台完整报告 artifact'
+        required: false
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - '.github/workflows/hw-probe.yml'
+      - 'scripts/hw_bench.py'
+      - 'scripts/merge_report.py'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/hw-probe.yml'
+      - 'scripts/hw_bench.py'
+      - 'scripts/merge_report.py'
+  schedule:
+    # 每周一 04:00 UTC，用默认三平台留一份周期性基线。不需要就删掉这段
+    - cron: '0 4 * * 1'
+
+# 只读就够了：本 workflow 只采集信息、只发 artifact，不推任何东西
+permissions:
+  contents: read
+
+# 同一分支的重复触发直接取消旧的，省时间。matrix 各平台之间互不取消
+concurrency:
+  group: hw-probe-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: "✅ 参数与标签预检"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # 输入统一走 env 注入，不在 shell 里直接内插 ${{ }}，避免脚本注入
+    env:
+      IN_LABELS: ${{ github.event.inputs.runner_labels || 'ubuntu-latest,windows-latest,macos-latest' }}
+      IN_SECONDS: ${{ github.event.inputs.bench_seconds || '3' }}
+      IN_DISK_MB: ${{ github.event.inputs.disk_mb || '1024' }}
+      IN_WORKERS: ${{ github.event.inputs.bench_workers || '0' }}
+    # GitHub Actions 表达式里没有 replace()，也没有任何字符串切分函数，
+    # 所以矩阵必须在这里用 bash 生成好再以 JSON 输出给 probe job
+    outputs:
+      matrix: ${{ steps.labels.outputs.matrix }}
+      count: ${{ steps.labels.outputs.count }}
+    steps:
+      - name: 🏷️ 校验 runner 标签并生成矩阵
+        id: labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          LABELS="$IN_LABELS"
+
+          # 2026-09 公开仓库可用的标准 runner 标签（分钟数免费无限量）
+          ALLOWED="ubuntu-latest ubuntu-24.04 ubuntu-22.04 ubuntu-26.04 ubuntu-slim
+          ubuntu-24.04-arm ubuntu-22.04-arm ubuntu-26.04-arm
+          windows-latest windows-2025 windows-2025-vs2026 windows-2022
+          windows-11-arm windows-11-vs2026-arm
+          macos-latest macos-14 macos-15 macos-26 macos-15-intel macos-26-intel xcode-27"
+
+          echo "输入标签: $LABELS"
+          if [[ "$LABELS" =~ [\"\'] ]]; then
+            echo "::error::runner_labels 含引号，无法安全生成 JSON 矩阵，请只用逗号分隔的标签"
+            exit 1
+          fi
+
+          IFS=',' read -ra RAW <<< "$LABELS"
+          CLEAN=()
+          for raw in "${RAW[@]}"; do
+            L="$(echo "$raw" | tr -d '[:space:]')"       # trim 掉首尾空格
+            [[ -z "$L" ]] && continue                     # 容忍尾随逗号
+            if ! grep -qwF "$L" <<< "$ALLOWED"; then
+              echo "::error::不支持的标签 '$L'。可用标签：$(echo "$ALLOWED" | xargs)"
+              exit 1
+            fi
+            # 去重保序，避免手写重复标签起两个一模一样的 job
+            dup=0
+            for c in ${CLEAN+"${CLEAN[@]}"}; do [[ "$c" == "$L" ]] && dup=1 && break; done
+            (( dup )) || CLEAN+=("$L")
+            echo "  ✅ $L"
+          done
+
+          if (( ${#CLEAN[@]} == 0 )); then
+            echo "::error::runner_labels 为空"
+            exit 1
+          fi
+
+          # 拼 JSON 数组。标签已过白名单校验，不含引号或反斜杠，拼接是安全的
+          JSON="["
+          for i in "${!CLEAN[@]}"; do
+            (( i > 0 )) && JSON+=","
+            JSON+="\"${CLEAN[$i]}\""
+          done
+          JSON+="]"
+
+          echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
+          echo "count=${#CLEAN[@]}" >> "$GITHUB_OUTPUT"
+          echo "矩阵: $JSON  (${#CLEAN[@]} 个平台)"
+
+      - name: 🔢 校验数值参数
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          fail() { echo "::error::$1"; exit 1; }
+
+          [[ "$IN_SECONDS" =~ ^[0-9]+$ ]] || fail "bench_seconds 必须是正整数，收到 '$IN_SECONDS'"
+          (( IN_SECONDS >= 1 && IN_SECONDS <= 60 )) || fail "bench_seconds 需在 1~60，收到 '$IN_SECONDS'"
+
+          [[ "$IN_DISK_MB" =~ ^[0-9]+$ ]] || fail "disk_mb 必须是正整数，收到 '$IN_DISK_MB'"
+          # 上限 8192MB：GitHub 文档写 14GB SSD（那是工作区配额），实测底层卷是
+          # 144/220/319 GB。留这个上限纯粹是为了控制单 job 时长与磁盘占用，不是因为装不下
+          (( IN_DISK_MB >= 64 && IN_DISK_MB <= 8192 )) || fail "disk_mb 需在 64~8192，收到 '$IN_DISK_MB'"
+
+          [[ "$IN_WORKERS" =~ ^[0-9]+$ ]] || fail "bench_workers 必须是整数（0=全部逻辑核），收到 '$IN_WORKERS'"
+          (( IN_WORKERS <= 64 )) || fail "bench_workers 上限 64，收到 '$IN_WORKERS'"
+
+          echo "✅ seconds=$IN_SECONDS disk_mb=$IN_DISK_MB workers=$IN_WORKERS"
+
+      - name: 💡 提示
+        shell: bash
+        run: |
+          cat <<'EOF'
+          探测矩阵即将启动。请注意这些既知差异，否则会误读结果：
+            - ubuntu-latest  = 4 vCPU / 16 GB / x64 VM
+            - ubuntu-slim    = 1 vCPU /  5 GB / x64 容器，job 超时 15 分钟，不支持 Docker-in-Docker
+            - windows-latest = 4 vCPU / 16 GB / x64 VM
+            - macos-latest   = 3 vCPU (M1) / 7 GB / arm64 —— 核数与内存都比另两个平台少
+            - 所有标准 runner 均无 GPU
+            - 公开仓库分钟数免费；私有仓库按分钟计费，macOS 费率为 Linux 的 10 倍
+          托管 runner 是共享物理机上的 VM，同标签两次运行的波动可达 ±30%，单次结果只宜定性比较。
+          EOF
+
+  probe:
+    name: "🔍 ${{ matrix.os }}"
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      # 某个平台挂了也要让其余平台跑完，否则拿不到对比数据
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        # 由 validate job 用 bash 生成 JSON 数组后传入。
+        # 不能用表达式拆 CSV —— GitHub Actions 既没有 replace() 也没有任何字符串切分函数
+        os: ${{ fromJson(needs.validate.outputs.matrix) }}
+    env:
+      # 统一固定 Python 版本，是三个平台基准可横向比较的前提
+      PY_VERSION: '3.12'
+      BENCH_SECONDS: ${{ github.event.inputs.bench_seconds || '3' }}
+      BENCH_DISK_MB: ${{ github.event.inputs.disk_mb || '1024' }}
+      BENCH_WORKERS: ${{ github.event.inputs.bench_workers || '0' }}
+      BENCH_NET: ${{ github.event.inputs.probe_net || 'true' }}
+      BENCH_NATIVE: ${{ github.event.inputs.native_bench || 'true' }}
+      UPLOAD_ARTIFACTS: ${{ github.event.inputs.upload_artifacts || 'true' }}
+      # 注意：PROBE_DIR 不能写在这里 —— runner 上下文在 job 级 env 不可用。
+      # 改由「初始化探测目录」step 写进 ${GITHUB_ENV}，后续每个 step 自动继承
+    steps:
+      - name: 📥 检出仓库
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 1
+
+      - name: 🐍 固定 Python ${{ env.PY_VERSION }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      - name: 🗂️ 初始化探测目录
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          # RUNNER_TEMP 是 runner 注入的真实环境变量，用它而不是 ${{ runner.temp }}
+          echo "PROBE_DIR=$RUNNER_TEMP/probe" >> "$GITHUB_ENV"
+          PROBE_DIR="$RUNNER_TEMP/probe"
+          mkdir -p "$PROBE_DIR"
+          echo "PROBE_DIR=$PROBE_DIR"
+          python -V 2>&1 || python3 -V 2>&1 || true
+
+          cat > "$PROBE_DIR/00-header.md" <<EOF
+          # 🖥️ 硬件 / 性能 / 软件环境探测报告
+
+          | 项 | 值 |
+          |---|---|
+          | Runner 标签 | \`$MATRIX_OS\` |
+          | runner.os / runner.arch | \`$RUNNER_OS\` / \`$RUNNER_ARCH\` |
+          | 触发事件 | \`${{ github.event_name }}\` |
+          | 提交 | \`${{ github.sha }}\` |
+          | 运行时刻 (UTC) | $(date -u '+%Y-%m-%d %H:%M:%S') |
+
+          > 本报告由 \`.github/workflows/hw-probe.yml\` 自动生成。所有数值均为**实测**，
+          > 采集不到的项一律标 \`n/a\`，不做推测填充。
+          EOF
+
+          cat "$PROBE_DIR/00-header.md"
+
+      - name: 🧠 探测 CPU 配置（Linux / macOS）
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          RUNNER_OS="${RUNNER_OS:-Linux}"
+          F="$PROBE_DIR/01-cpu.md"
+          printf '%s\n' '## 🧠 CPU 配置' > "$F"
+          emit(){ printf '%s\n' "$@" >> "$F"; }
+
+          ARCH_M="$(uname -m 2>/dev/null || echo unknown)"
+          LONG_BIT="$(getconf LONG_BIT 2>/dev/null || echo n/a)"
+          case "$ARCH_M" in
+            x86_64|amd64)  ARCH_LABEL="x64" ;;
+            aarch64|arm64) ARCH_LABEL="arm64" ;;
+            *)             ARCH_LABEL="$ARCH_M" ;;
+          esac
+
+          emit ""
+          emit "### 架构判定（公共）"
+          emit ""
+          emit "| 项 | 值 |"
+          emit "|---|---|"
+          emit "| uname -m | \`$ARCH_M\` |"
+          emit "| getconf LONG_BIT | \`$LONG_BIT\` |"
+          emit "| **架构结论** | **$ARCH_LABEL** |"
+          emit ""
+          emit "> **架构 = $ARCH_LABEL**（供后续报告使用）"
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            emit ""
+            emit "### macOS：sysctl CPU 信息"
+            emit ""
+            emit "| 键 | 值 |"
+            emit "|---|---|"
+            for k in machdep.cpu.brand_string hw.model hw.ncpu hw.physicalcpu hw.logicalcpu \
+                     hw.cpufamily hw.cputype hw.cpufrequency hw.cpufrequency_max hw.tbfrequency \
+                     hw.optional.arm64 hw.optional.neon; do
+              v="$(sysctl -n "$k" 2>/dev/null || true)"
+              [ -n "$v" ] || v="n/a"
+              v="$(printf '%s' "$v" | tr '|' '/')"
+              emit "| \`$k\` | $v |"
+            done
+
+            if v="$(sysctl -n machdep.cpu.features 2>/dev/null)" && [ -n "$v" ]; then
+              emit ""
+              emit "### machdep.cpu.features（Intel）"
+              emit '```text'
+              printf '%s\n' "$v" >> "$F"
+              emit '```'
+              if v7="$(sysctl -n machdep.cpu.leaf7_features 2>/dev/null)" && [ -n "$v7" ]; then
+                emit ""
+                emit "### machdep.cpu.leaf7_features（Intel）"
+                emit '```text'
+                printf '%s\n' "$v7" >> "$F"
+                emit '```'
+              fi
+            else
+              emit ""
+              emit "### Apple Silicon：hw.optional 指令集"
+              emit '```text'
+              sysctl -a 2>/dev/null | grep '^hw.optional' >> "$F" || true
+              emit '```'
+            fi
+
+            emit ""
+            emit "### 缓存大小"
+            emit ""
+            emit "| 键 | 值 |"
+            emit "|---|---|"
+            for k in hw.l1icachesize hw.l1dcachesize hw.l2cachesize hw.l3cachesize; do
+              v="$(sysctl -n "$k" 2>/dev/null || true)"
+              [ -n "$v" ] || v="n/a"
+              emit "| \`$k\` | $v |"
+            done
+
+            if command -v system_profiler >/dev/null 2>&1; then
+              emit ""
+              emit "### system_profiler：硬件与处理器（该命令较慢，耐心等待）"
+              emit '```text'
+              system_profiler SPHardwareDataType SPProcessorsDataType >> "$F" 2>&1 || true
+              emit '```'
+            else
+              emit "- \`system_profiler\`：未安装"
+            fi
+
+            emit ""
+            emit "### 负载（macOS）"
+            emit '```text'
+            uptime >> "$F" 2>&1 || true
+            sysctl vm.loadavg >> "$F" 2>&1 || true
+            emit '```'
+          else
+            emit ""
+            emit "### Linux：核心与型号"
+            emit ""
+            emit "| 项 | 值 |"
+            emit "|---|---|"
+            if command -v nproc >/dev/null 2>&1; then
+              emit "| nproc（逻辑核数） | $(nproc 2>/dev/null || echo n/a) |"
+            else
+              emit "| \`nproc\` | 未安装 |"
+            fi
+            if [ -r /proc/cpuinfo ]; then
+              NPROC_CNT="$(grep -c ^processor /proc/cpuinfo 2>/dev/null)"
+              NPROC_CNT="${NPROC_CNT:-n/a}"
+              emit "| /proc/cpuinfo processor 条目数 | $NPROC_CNT |"
+              MODEL="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^[[:space:]]*//' || true)"
+              [ -n "$MODEL" ] || MODEL="n/a（本架构 /proc/cpuinfo 无 model name 字段）"
+              emit "| model name | $MODEL |"
+              MHZ="$(grep -m1 'cpu MHz' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^[[:space:]]*//' || true)"
+              [ -n "$MHZ" ] || MHZ="n/a"
+              emit "| cpu MHz | $MHZ |"
+            else
+              emit "| /proc/cpuinfo | 不可读 |"
+            fi
+
+            if command -v lscpu >/dev/null 2>&1; then
+              emit ""
+              emit "### lscpu 全文"
+              emit '```text'
+              lscpu >> "$F" 2>&1 || true
+              emit '```'
+              emit ""
+              emit "### CPU 拓扑（lscpu -p=CPU,SOCKET,CORE，前 8 行）"
+              emit '```text'
+              lscpu -p=CPU,SOCKET,CORE 2>/dev/null | grep -v '^#' | head -n 8 >> "$F" || true
+              emit '```'
+            else
+              emit "- \`lscpu\`：未安装"
+            fi
+
+            FLAGS_LINE="$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)"
+            if [ -n "$FLAGS_LINE" ]; then
+              FLAGS_BODY="$(printf '%s' "$FLAGS_LINE" | cut -d: -f2-)"
+              FLAG_CNT="$(printf '%s' "$FLAGS_BODY" | tr ' ' '\n' | sed '/^$/d' | wc -l | tr -d ' ')"
+              emit ""
+              emit "### 指令集（x86 flags）"
+              emit ""
+              emit "- CPU flags 总数：$FLAG_CNT"
+              emit ""
+              emit "| 指令集 | 是否支持 |"
+              emit "|---|---|"
+              for ins in avx512f avx2 avx sse4_2 aes bmi2 sha_ni; do
+                if printf '%s' "$FLAGS_BODY" | tr ' ' '\n' | grep -qx "$ins"; then
+                  emit "| $ins | 支持 |"
+                else
+                  emit "| $ins | 不支持 |"
+                fi
+              done
+            else
+              emit "- CPU flags：n/a（非 x86 架构，/proc/cpuinfo 无 flags 行）"
+            fi
+
+            emit ""
+            emit "### NUMA"
+            if command -v numactl >/dev/null 2>&1; then
+              emit '```text'
+              numactl --hardware >> "$F" 2>&1 || true
+              emit '```'
+            elif [ -d /sys/devices/system/node ]; then
+              NODE_CNT="$(ls /sys/devices/system/node 2>/dev/null | grep -c '^node[0-9]')"
+              NODE_CNT="${NODE_CNT:-0}"
+              emit "- NUMA node 数量（/sys/devices/system/node/ 计数）：$NODE_CNT"
+            else
+              emit "- NUMA：n/a（无 numactl 且无 /sys/devices/system/node/）"
+            fi
+
+            emit ""
+            emit "### cgroup CPU 限制（识别容器型 runner，如 ubuntu-slim）"
+            if [ -r /sys/fs/cgroup/cpu.max ]; then
+              CG_V2="$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || true)"
+              CGQ="$(printf '%s' "$CG_V2" | awk '{print $1}')"
+              CGP="$(printf '%s' "$CG_V2" | awk '{print $2}')"
+              emit "- cgroup v2 \`cpu.max\`：\`$CGQ $CGP\`"
+              if [ "$CGQ" = "max" ] || [ -z "$CGQ" ]; then
+                emit "- 等效核数：无限制"
+              else
+                emit "- 等效核数：$(awk -v q="$CGQ" -v p="$CGP" 'BEGIN{ if (p+0>0) printf "%.2f", q/p; else print "n/a" }')"
+              fi
+            elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
+              Q="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo 0)"
+              P="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo 0)"
+              emit "- cgroup v1 \`cpu.cfs_quota_us\`：\`$Q\`；\`cpu.cfs_period_us\`：\`$P\`"
+              emit "- 等效核数：$(awk -v q="$Q" -v p="$P" 'BEGIN{ if (q+0>0 && p+0>0) printf "%.2f", q/p; else print "无限制或 n/a" }')"
+            else
+              emit "- 未检测到 cgroup CPU 限制文件（非容器环境或不可读）"
+            fi
+
+            emit ""
+            emit "### CPU 频率（cpufreq）"
+            for kf in cpuinfo_max_freq scaling_governor; do
+              kp="/sys/devices/system/cpu/cpu0/cpufreq/$kf"
+              if [ -r "$kp" ]; then
+                emit "- ${kf}：\`$(cat "$kp" 2>/dev/null || echo n/a)\`"
+              else
+                emit "- ${kf}：n/a（云环境通常不存在 cpufreq）"
+              fi
+            done
+
+            emit ""
+            emit "### 负载（Linux）"
+            emit '```text'
+            cat /proc/loadavg >> "$F" 2>/dev/null || emit "( /proc/loadavg 不可读 )"
+            if command -v uptime >/dev/null 2>&1; then
+              uptime >> "$F" 2>&1 || true
+            else
+              emit "( uptime：未安装 )"
+            fi
+            emit '```'
+          fi
+
+          echo ""
+          ls -la "$PROBE_DIR"
+      - name: 💾 探测内存配置（Linux / macOS）
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          RUNNER_OS="${RUNNER_OS:-Linux}"
+          F="$PROBE_DIR/02-memory.md"
+          printf '%s\n' '## 💾 内存配置' > "$F"
+          emit(){ printf '%s\n' "$@" >> "$F"; }
+
+          emit ""
+          emit "### 页大小（公共）"
+          if command -v python3 >/dev/null 2>&1; then
+            PS_PY="$(python3 -c "import os;print(os.sysconf('SC_PAGE_SIZE'))" 2>/dev/null || true)"
+            [ -n "$PS_PY" ] || PS_PY="n/a"
+            emit "- \`os.sysconf('SC_PAGE_SIZE')\`：\`$PS_PY\` 字节"
+          else
+            emit "- \`python3\`：未安装"
+          fi
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            emit ""
+            emit "### macOS：物理内存"
+            emit ""
+            emit "| 键 | 值 |"
+            emit "|---|---|"
+            MEMSIZE="$(sysctl -n hw.memsize 2>/dev/null || true)"
+            if [ -n "$MEMSIZE" ]; then
+              emit "| hw.memsize | $MEMSIZE 字节（$(awk -v b="$MEMSIZE" 'BEGIN{printf "%.2f GB", b/1073741824}')） |"
+            else
+              emit "| hw.memsize | n/a |"
+            fi
+            MEMU="$(sysctl -n hw.memsize_usable 2>/dev/null || true)"
+            if [ -n "$MEMU" ]; then
+              emit "| hw.memsize_usable | $MEMU 字节（$(awk -v b="$MEMU" 'BEGIN{printf "%.2f GB", b/1073741824}')） |"
+            else
+              emit "| hw.memsize_usable | n/a（该键可能不存在） |"
+            fi
+            for k in vm.compressor_mode hw.usermem; do
+              v="$(sysctl -n "$k" 2>/dev/null || true)"
+              [ -n "$v" ] || v="n/a"
+              emit "| $k | $v |"
+            done
+            v="$(sysctl -n vm.swapusage 2>/dev/null || true)"
+            [ -n "$v" ] || v="n/a"
+            emit "| vm.swapusage | $v |"
+
+            emit ""
+            emit "### vm_stat 全文"
+            emit '```text'
+            vm_stat >> "$F" 2>&1 || true
+            emit '```'
+
+            PGSZ="$(sysctl -n hw.pagesize 2>/dev/null || echo 0)"
+            emit ""
+            emit "### vm_stat 换算（页大小 = $PGSZ 字节）"
+            emit ""
+            emit "| 类别 | 页数 | MB |"
+            emit "|---|---|---|"
+            vm_stat 2>/dev/null | awk -v ps="$PGSZ" '
+              {
+                line = $0
+                sub(/\.$/, "", line)
+                i = index(line, ":")
+                if (i > 1) {
+                  name = substr(line, 1, i-1)
+                  val = substr(line, i+1)
+                  gsub(/ /, "", val)
+                  gsub(/\|/, "/", name)
+                  if (val ~ /^[0-9]+$/ && ps+0 > 0)
+                    printf "| %s | %s | %.1f |\n", name, val, val*ps/1048576
+                }
+              }' >> "$F" || true
+
+            emit ""
+            emit "### memory_pressure（前 20 行）"
+            if command -v memory_pressure >/dev/null 2>&1; then
+              emit '```text'
+              memory_pressure 2>/dev/null | head -n 20 >> "$F" || true
+              emit '```'
+            else
+              emit "- \`memory_pressure\`：未安装"
+            fi
+          else
+            emit ""
+            emit "### Linux：free -h"
+            if command -v free >/dev/null 2>&1; then
+              emit ""
+              emit "| 项 | 值 |"
+              emit "|---|---|"
+              free -h 2>/dev/null | awk 'NR==2{
+                av = "n/a"
+                if (NF >= 7) av = $7
+                printf "| total | %s |\n| used | %s |\n| free | %s |\n| available | %s |\n", $2, $3, $4, av
+              }' >> "$F" || true
+              emit ""
+              emit "### free -h 原始输出"
+              emit '```text'
+              free -h >> "$F" 2>&1 || true
+              emit '```'
+            else
+              emit "- \`free\`：未安装"
+            fi
+
+            if [ -r /proc/meminfo ]; then
+              emit ""
+              emit "### /proc/meminfo（前 40 行）"
+              emit '```text'
+              head -n 40 /proc/meminfo >> "$F" 2>&1 || true
+              emit '```'
+              emit ""
+              emit "### HugePages"
+              emit '```text'
+              grep -i huge /proc/meminfo >> "$F" 2>&1 || emit "( 无 HugePages 相关条目 )"
+              emit '```'
+              AVAIL_GB="$(awk '/MemAvailable/{printf "%.2f", $2/1024/1024}' /proc/meminfo 2>/dev/null || true)"
+              [ -n "$AVAIL_GB" ] || AVAIL_GB="n/a"
+              emit "- 实测可用内存（MemAvailable）：**$AVAIL_GB GB**"
+            else
+              emit "- /proc/meminfo：不可读"
+            fi
+
+            emit ""
+            emit "### cgroup 内存上限"
+            if [ -r /sys/fs/cgroup/memory.max ]; then
+              MV="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+              if [ "$MV" = "max" ] || [ -z "$MV" ]; then
+                emit "- cgroup v2 \`memory.max\`：\`max\`（无限制）"
+              else
+                emit "- cgroup v2 \`memory.max\`：\`$MV\` 字节 = $(awk -v b="$MV" 'BEGIN{printf "%.2f GB", b/1073741824}')"
+              fi
+            elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+              MV="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true)"
+              emit "- cgroup v1 \`memory.limit_in_bytes\`：\`$MV\` 字节 = $(awk -v b="$MV" 'BEGIN{ if (b+0>0 && b<1099511627776) printf "%.2f GB", b/1073741824; else print "无限制或 n/a" }')"
+            else
+              emit "- 未检测到 cgroup 内存限制文件（非容器环境或不可读）"
+            fi
+
+            emit ""
+            emit "### Swap"
+            emit '```text'
+            if command -v swapon >/dev/null 2>&1; then
+              swapon --show >> "$F" 2>&1 || true
+            else
+              emit "( swapon：未安装 )"
+            fi
+            cat /proc/swaps >> "$F" 2>/dev/null || emit "( /proc/swaps 不可读 )"
+            emit '```'
+          fi
+
+          echo ""
+          ls -la "$PROBE_DIR"
+      - name: 🗄️ 探测磁盘存储（Linux / macOS）
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          RUNNER_OS="${RUNNER_OS:-Linux}"
+          F="$PROBE_DIR/03-disk.md"
+          printf '%s\n' '## 🗄️ 磁盘 / 存储' > "$F"
+          emit(){ printf '%s\n' "$@" >> "$F"; }
+          FSTYPE=""
+          DU_INFO=""
+          SP_STORAGE=""
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            emit ""
+            emit "### macOS：df -h"
+            emit '```text'
+            df -h >> "$F" 2>&1 || true
+            emit '```'
+
+            if command -v diskutil >/dev/null 2>&1; then
+              emit ""
+              emit "### diskutil list"
+              emit '```text'
+              diskutil list >> "$F" 2>&1 || true
+              emit '```'
+              DU_INFO="$(diskutil info / 2>/dev/null || true)"
+              emit ""
+              emit "### diskutil info /（含 File System Personality / Protocol / Device / Media Name）"
+              emit '```text'
+              printf '%s\n' "$DU_INFO" >> "$F"
+              emit '```'
+            else
+              emit "- \`diskutil\`：未安装"
+            fi
+
+            if command -v system_profiler >/dev/null 2>&1; then
+              emit ""
+              emit "### system_profiler：NVMe 与存储（该命令较慢）"
+              SP_STORAGE="$(system_profiler SPNVMeDataType SPStorageDataType 2>/dev/null || true)"
+              emit '```text'
+              printf '%s\n' "$SP_STORAGE" >> "$F"
+              emit '```'
+            else
+              emit "- \`system_profiler\`：未安装"
+            fi
+
+            emit ""
+            emit "### mount（macOS）"
+            emit '```text'
+            mount >> "$F" 2>&1 || true
+            emit '```'
+            FSTYPE="$(mount 2>/dev/null | awk '$3=="/"{print $5; exit}')"
+          else
+            emit ""
+            emit "### Linux：df -h（全部）"
+            emit '```text'
+            df -h >> "$F" 2>&1 || true
+            emit '```'
+            emit ""
+            emit "### df -i（inode）"
+            emit '```text'
+            df -i >> "$F" 2>&1 || true
+            emit '```'
+
+            emit ""
+            emit "### 与 / 、/mnt 、/home 、当前工作目录相关的挂载"
+            emit '```text'
+            mount 2>/dev/null | grep -E " on (/|/mnt|/home|/tmp) " >> "$F" || true
+            mount 2>/dev/null | grep -F " on $(pwd) " >> "$F" || true
+            emit '```'
+
+            if command -v lsblk >/dev/null 2>&1; then
+              emit ""
+              emit "### lsblk（ROTA=0 表示非旋转设备即 SSD，ROTA=1 为机械盘）"
+              emit '```text'
+              lsblk -o NAME,SIZE,TYPE,ROTA,MODEL,MOUNTPOINT >> "$F" 2>&1 || true
+              emit '```'
+              emit ""
+              emit "### lsblk discard 特性（SSD TRIM 能力，DISC-*）"
+              emit '```text'
+              if lsblk -d -o NAME,DISC-ALGN,DISC-GRAN,DISC-MAX >/dev/null 2>&1; then
+                lsblk -d -o NAME,DISC-ALGN,DISC-GRAN,DISC-MAX >> "$F" 2>&1 || true
+              else
+                lsblk -d >> "$F" 2>&1 || true
+                emit "( 当前 lsblk 版本不支持 DISC-* 列 )"
+              fi
+              emit '```'
+            else
+              emit "- \`lsblk\`：未安装"
+            fi
+
+            emit ""
+            emit "### 块设备队列参数"
+            emit ""
+            emit "| 设备 | rotational | scheduler |"
+            emit "|---|---|---|"
+            if [ -d /sys/block ]; then
+              for d in /sys/block/*/; do
+                [ -d "$d" ] || continue
+                n="$(basename "$d")"
+                rot="n/a"
+                sch="n/a"
+                [ -r "$d/queue/rotational" ] && rot="$(cat "$d/queue/rotational" 2>/dev/null)"
+                [ -r "$d/queue/scheduler" ] && sch="$(cat "$d/queue/scheduler" 2>/dev/null | tr '|' '/')"
+                emit "| $n | $rot | $sch |"
+              done
+            else
+              emit "| （n/a） | /sys/block 不存在 | n/a |"
+            fi
+
+            emit ""
+            emit "### NVMe 设备"
+            if command -v nvme >/dev/null 2>&1; then
+              emit '```text'
+              nvme list >> "$F" 2>&1 || true
+              emit '```'
+            else
+              emit "- \`nvme\`：未安装，改列 \`/dev/disk/by-id/\`："
+              emit '```text'
+              ls -l /dev/disk/by-id/ >> "$F" 2>/dev/null || emit "( /dev/disk/by-id/ 不存在 )"
+              emit '```'
+            fi
+
+            if command -v findmnt >/dev/null 2>&1; then
+              FSTYPE="$(findmnt -no FSTYPE -T "$PROBE_DIR" 2>/dev/null || true)"
+            else
+              emit "- \`findmnt\`：未安装"
+            fi
+          fi
+
+          emit ""
+          emit "### 关键结论"
+          emit ""
+          DF_LINE="$(df -h "$PROBE_DIR" 2>/dev/null | awk 'NR==2' || true)"
+          DF_DEV="$(printf '%s\n' "$DF_LINE" | awk '{print $1}')"
+          DF_TOTAL="$(printf '%s\n' "$DF_LINE" | awk '{print $2}')"
+          DF_AVAIL="$(printf '%s\n' "$DF_LINE" | awk '{print $4}')"
+          DF_MNT="$(printf '%s\n' "$DF_LINE" | awk '{print $NF}')"
+          [ -n "$DF_DEV" ] || DF_DEV="n/a"
+          [ -n "$DF_TOTAL" ] || DF_TOTAL="n/a"
+          [ -n "$DF_AVAIL" ] || DF_AVAIL="n/a"
+          [ -n "$DF_MNT" ] || DF_MNT="n/a"
+          [ -n "$FSTYPE" ] || FSTYPE="n/a"
+
+          SSD_FLAG="n/a"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if printf '%s\n%s\n' "$DU_INFO" "$SP_STORAGE" | grep -qiE 'solid state|medium type.*ssd|protocol.*(nvme|apple fabric)'; then
+              SSD_FLAG="是（SSD）"
+            fi
+          else
+            if [ "$DF_DEV" != "n/a" ] && command -v lsblk >/dev/null 2>&1; then
+              PK="$(lsblk -no PKNAME "$DF_DEV" 2>/dev/null || true)"
+              [ -n "$PK" ] || PK="$(basename "$DF_DEV" 2>/dev/null || true)"
+              if [ -n "$PK" ] && [ -r "/sys/block/$PK/queue/rotational" ]; then
+                if [ "$(cat "/sys/block/$PK/queue/rotational" 2>/dev/null)" = "0" ]; then
+                  SSD_FLAG="是（SSD，rotational=0）"
+                else
+                  SSD_FLAG="否（rotational=1，机械盘）"
+                fi
+              fi
+            fi
+          fi
+
+          NET_FLAG="n/a"
+          case "$FSTYPE" in
+            nfs*|cifs|smbfs|afpfs|sshfs|9p|lustre|gpfs|wekafs|osxfuse*) NET_FLAG="是" ;;
+            *overlay*|*aufs*) NET_FLAG="否（容器本地覆盖层）" ;;
+            n/a) NET_FLAG="n/a" ;;
+            *) NET_FLAG="否" ;;
+          esac
+
+          emit "| 项 | 值 |"
+          emit "|---|---|"
+          emit "| \`$PROBE_DIR\` 所在挂载点 | \`$DF_MNT\` |"
+          emit "| 文件系统类型 | \`$FSTYPE\` |"
+          emit "| 总容量 | $DF_TOTAL |"
+          emit "| 可用容量 | $DF_AVAIL |"
+          emit "| 是否 SSD | $SSD_FLAG |"
+          emit "| 是否网络挂载 | $NET_FLAG |"
+          emit ""
+          emit "> 对照：GitHub 标准托管 runner 的既知规格为 **14 GB SSD**（本地工作磁盘）。"
+          emit "> 若上表可用容量显著偏离该值，说明是特殊机型 / larger runner / self-hosted runner。"
+
+          echo ""
+          ls -la "$PROBE_DIR"
+      - name: 🎮 探测 GPU / 加速器（Linux / macOS）
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          RUNNER_OS="${RUNNER_OS:-Linux}"
+          F="$PROBE_DIR/04-gpu.md"
+          printf '%s\n' '## 🎮 GPU / 加速器' > "$F"
+          emit(){ printf '%s\n' "$@" >> "$F"; }
+          GPU_DESC=""
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            emit ""
+            emit "### macOS：图形处理器（system_profiler SPDisplaysDataType）"
+            CHIP=""
+            if command -v system_profiler >/dev/null 2>&1; then
+              SP_DISP="$(system_profiler SPDisplaysDataType 2>/dev/null || true)"
+              emit '```text'
+              printf '%s\n' "$SP_DISP" >> "$F"
+              emit '```'
+              CHIP="$(printf '%s\n' "$SP_DISP" | grep -m1 'Chipset Model' | cut -d: -f2- | sed 's/^[[:space:]]*//' || true)"
+            else
+              emit "- \`system_profiler\`：未安装"
+            fi
+            if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = "1" ]; then
+              emit "- \`hw.optional.arm64 = 1\`：本机为 **Apple Silicon**，使用 SoC 集成 GPU（Metal 可用）"
+              GPU_DESC="检测到 Apple Silicon 集成 GPU${CHIP:+（${CHIP}）}，可用 Metal，但无独立显卡、无 CUDA"
+            elif [ -n "$CHIP" ]; then
+              emit "- Intel Mac，Chipset Model：\`$CHIP\`"
+              GPU_DESC="检测到 GPU：$CHIP"
+            fi
+          else
+            emit ""
+            emit "### Linux：PCI 显示设备"
+            if command -v lspci >/dev/null 2>&1; then
+              LSPCI_GPU="$(lspci 2>/dev/null | grep -iE 'vga|3d|display' || true)"
+              if [ -n "$LSPCI_GPU" ]; then
+                emit '```text'
+                printf '%s\n' "$LSPCI_GPU" >> "$F"
+                emit '```'
+                GPU_DESC="检测到 PCI 显示设备：$(printf '%s\n' "$LSPCI_GPU" | head -n 1 | tr '|' '/')"
+              else
+                emit "- lspci 可用，但未匹配到 VGA / 3D / Display 控制器"
+              fi
+            else
+              emit "- \`lspci\`：未安装"
+            fi
+
+            emit ""
+            emit "### DRI 设备节点（/dev/dri）"
+            if [ -e /dev/dri ]; then
+              emit '```text'
+              ls -l /dev/dri >> "$F" 2>&1 || true
+              emit '```'
+            else
+              emit "- \`/dev/dri\` 不存在（无 DRI 设备节点）"
+            fi
+
+            emit ""
+            emit "### NVIDIA"
+            if command -v nvidia-smi >/dev/null 2>&1; then
+              emit '```text'
+              nvidia-smi >> "$F" 2>&1 || true
+              emit '```'
+              GPU_DESC="检测到 NVIDIA GPU：$(nvidia-smi -L 2>/dev/null | head -n 1 || echo 'nvidia-smi 可用')"
+            else
+              emit "- \`nvidia-smi\`：未安装（无 NVIDIA GPU / 驱动）"
+            fi
+            if [ -r /proc/driver/nvidia/version ]; then
+              emit "- /proc/driver/nvidia/version 内容："
+              emit '```text'
+              cat /proc/driver/nvidia/version >> "$F" 2>&1 || true
+              emit '```'
+            else
+              emit "- \`/proc/driver/nvidia/version\`：不存在"
+            fi
+
+            emit ""
+            emit "### GPU 相关内核模块（lsmod）"
+            if command -v lsmod >/dev/null 2>&1; then
+              LSMOD_GPU="$(lsmod 2>/dev/null | grep -iE 'nvidia|nouveau|amdgpu|i915' || true)"
+              if [ -n "$LSMOD_GPU" ]; then
+                emit '```text'
+                printf '%s\n' "$LSMOD_GPU" >> "$F"
+                emit '```'
+              else
+                emit "- 未检测到 nvidia / nouveau / amdgpu / i915 相关内核模块"
+              fi
+            else
+              emit "- \`lsmod\`：未安装或不可读"
+            fi
+
+            emit ""
+            emit "### OpenGL / Vulkan"
+            if command -v glxinfo >/dev/null 2>&1; then
+              emit '```text'
+              glxinfo -B >> "$F" 2>&1 || true
+              emit '```'
+            elif command -v vulkaninfo >/dev/null 2>&1; then
+              emit '```text'
+              vulkaninfo --summary >> "$F" 2>&1 || true
+              emit '```'
+            else
+              emit "- \`glxinfo\` / \`vulkaninfo\`：均未安装"
+            fi
+          fi
+
+          emit ""
+          if [ -n "$GPU_DESC" ]; then
+            emit "> **结论**：当前 runner ${GPU_DESC}。"
+            emit "> GitHub 标准托管 runner 不含独立 GPU，CUDA / OpenCL 类工作负载无法在此环境评估；"
+            emit "> 若为集成 GPU（如 Apple Silicon），Metal 可用但仅适合轻量验证。"
+            emit "> 如需 GPU 基准，请使用 larger runner 的 GPU 机型或 self-hosted runner。"
+          else
+            emit "> **结论**：当前 runner 未检测到独立 GPU。GitHub 标准托管 runner 不含 GPU，"
+            emit "> 因此 Metal / CUDA / OpenCL 类工作负载无法在此环境评估。如需 GPU 基准，请使用 larger runner"
+            emit "> 的 GPU 机型或 self-hosted runner。"
+          fi
+
+          echo ""
+          ls -la "$PROBE_DIR"
+
+      - name: 🪟 Windows 硬件探测 · 01 CPU（01-cpu.md）
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $PSNativeCommandArgumentPassing = 'Standard'
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'SilentlyContinue'
+          try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+          $P = $env:PROBE_DIR
+          if (-not $P) { $P = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'probe' }
+          if (-not (Test-Path -LiteralPath $P)) { New-Item -ItemType Directory -Path $P -Force | Out-Null }
+          $script:OutFile = Join-Path -Path $P -ChildPath '01-cpu.md'
+          function Emit { param([string[]]$Lines) Add-Content -LiteralPath $script:OutFile -Value $Lines -Encoding UTF8 }
+          function NA { param($v) if ($null -eq $v -or "$v" -eq '') { 'n/a' } else { "$v" } }
+          function Tbl { param([string]$k, $v) $s = NA $v; Emit ('| ' + $k + ' | ' + ($s -replace '\|', '/') + ' |') }
+          function H3 { param([string]$t, [string]$c1 = '项', [string]$c2 = '值') Emit ''; Emit ('### ' + $t); Emit ''; Emit ('| ' + $c1 + ' | ' + $c2 + ' |'); Emit '|---|---|' }
+
+          Set-Content -LiteralPath $script:OutFile -Value '## 🧠 CPU 配置' -Encoding UTF8
+
+          $archMap = @{ 0 = 'x86'; 1 = 'MIPS'; 2 = 'Alpha'; 3 = 'PowerPC'; 5 = 'ARM'; 6 = 'Itanium'; 9 = 'x64'; 12 = 'ARM64' }
+
+          try {
+            $cpus = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
+            H3 '处理器（Win32_Processor）'
+            if ($cpus.Count -eq 0) { Tbl 'Win32_Processor' 'n/a（未返回实例）' }
+            $idx = 0
+            foreach ($c in $cpus) {
+              $idx++
+              $pfx = ''
+              if ($cpus.Count -gt 1) { $pfx = ('CPU' + $idx + ' ') }
+              Tbl ($pfx + 'Name') $c.Name
+              Tbl ($pfx + 'Manufacturer') $c.Manufacturer
+              Tbl ($pfx + 'Caption') $c.Caption
+              $archName = NA $c.Architecture
+              if ($null -ne $c.Architecture -and $archMap.ContainsKey([int]$c.Architecture)) { $archName = $archMap[[int]$c.Architecture] }
+              Tbl ($pfx + 'Architecture（解码）') $archName
+              Tbl ($pfx + 'Architecture（原始值）') $c.Architecture
+              Tbl ($pfx + 'NumberOfCores') $c.NumberOfCores
+              Tbl ($pfx + 'NumberOfLogicalProcessors') $c.NumberOfLogicalProcessors
+              Tbl ($pfx + 'MaxClockSpeed (MHz)') $c.MaxClockSpeed
+              Tbl ($pfx + 'CurrentClockSpeed (MHz)') $c.CurrentClockSpeed
+              Tbl ($pfx + 'L2CacheSize (KB)') $c.L2CacheSize
+              Tbl ($pfx + 'L3CacheSize (KB)') $c.L3CacheSize
+              Tbl ($pfx + 'SocketDesignation') $c.SocketDesignation
+              Tbl ($pfx + 'VirtualizationFirmwareEnabled') $c.VirtualizationFirmwareEnabled
+              Tbl ($pfx + 'VMMonitorModeExtensions') $c.VMMonitorModeExtensions
+            }
+          } catch {
+            H3 '处理器（Win32_Processor）'
+            Tbl 'Win32_Processor' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          H3 '进程环境变量 / .NET 运行时'
+          try { Tbl '[Environment]::ProcessorCount' ([Environment]::ProcessorCount) } catch { Tbl '[Environment]::ProcessorCount' 'n/a' }
+          Tbl 'NUMBER_OF_PROCESSORS' $env:NUMBER_OF_PROCESSORS
+          Tbl 'PROCESSOR_IDENTIFIER' $env:PROCESSOR_IDENTIFIER
+          Tbl 'PROCESSOR_ARCHITECTURE' $env:PROCESSOR_ARCHITECTURE
+          Tbl 'PROCESSOR_LEVEL' $env:PROCESSOR_LEVEL
+          Tbl 'PROCESSOR_REVISION' $env:PROCESSOR_REVISION
+          try { Tbl 'OSVersion' ([string][System.Environment]::OSVersion) } catch { Tbl 'OSVersion' 'n/a' }
+
+          H3 'CPU 指令集特性（.NET System.Runtime.Intrinsics 探测）' '特性' '支持情况'
+          try { Add-Type -AssemblyName System.Runtime.Intrinsics -ErrorAction Stop } catch { }
+          $featSets = @(
+            @{ Title = 'x86'; Feats = @(
+              @{ n = 'Avx512F'; t = 'System.Runtime.Intrinsics.X86.Avx512F' },
+              @{ n = 'Avx2'; t = 'System.Runtime.Intrinsics.X86.Avx2' },
+              @{ n = 'Avx'; t = 'System.Runtime.Intrinsics.X86.Avx' },
+              @{ n = 'Sse42'; t = 'System.Runtime.Intrinsics.X86.Sse42' },
+              @{ n = 'Aes'; t = 'System.Runtime.Intrinsics.X86.Aes' },
+              @{ n = 'Bmi2'; t = 'System.Runtime.Intrinsics.X86.Bmi2' },
+              @{ n = 'Sha'; t = 'System.Runtime.Intrinsics.X86.Sha' }
+            ) },
+            @{ Title = 'Arm'; Feats = @(
+              @{ n = 'Neon (AdvSimd)'; t = 'System.Runtime.Intrinsics.Arm.AdvSimd' },
+              @{ n = 'Sve'; t = 'System.Runtime.Intrinsics.Arm.Sve' },
+              @{ n = 'Aes (Arm)'; t = 'System.Runtime.Intrinsics.Arm.Aes' }
+            ) }
+          )
+          foreach ($set in $featSets) {
+            foreach ($f in $set.Feats) {
+              $label = ($set.Title + ' / ' + $f.n)
+              $ft = $null
+              try { $ft = [Type]::GetType(($f.t + ', System.Runtime.Intrinsics'), $false) } catch { }
+              if ($null -eq $ft) { try { $ft = [Type]::GetType($f.t, $false) } catch { } }
+              if ($null -eq $ft) { Tbl $label 'n/a（类型不可用）'; continue }
+              try {
+                $prop = $ft.GetProperty('IsSupported', ([System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static))
+                if ($null -eq $prop) { Tbl $label 'n/a（属性不可用）'; continue }
+                Tbl $label ([string]$prop.GetValue($null))
+              } catch {
+                Tbl $label 'n/a'
+              }
+            }
+          }
+
+          $hyperVisor = 'n/a'
+          $virtFw = 'n/a'
+          try {
+            $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+            H3 '主机 / 虚拟化（Win32_ComputerSystem）'
+            Tbl 'Manufacturer' $cs.Manufacturer
+            Tbl 'Model' $cs.Model
+            Tbl 'SystemFamily' $cs.SystemFamily
+            Tbl 'TotalPhysicalMemory (bytes)' $cs.TotalPhysicalMemory
+            Tbl 'NumberOfProcessors' $cs.NumberOfProcessors
+            Tbl 'NumberOfLogicalProcessors' $cs.NumberOfLogicalProcessors
+            Tbl 'HypervisorPresent' $cs.HypervisorPresent
+            $hyperVisor = (NA $cs.HypervisorPresent)
+          } catch {
+            H3 '主机 / 虚拟化（Win32_ComputerSystem）'
+            Tbl 'Win32_ComputerSystem' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          try {
+            $csp = Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop
+            H3 '整机型号（Win32_ComputerSystemProduct）'
+            Tbl 'Name' $csp.Name
+            Tbl 'Vendor' $csp.Vendor
+            Tbl 'Version' $csp.Version
+            Tbl 'IdentifyingNumber' $csp.IdentifyingNumber
+          } catch {
+            H3 '整机型号（Win32_ComputerSystemProduct）'
+            Tbl 'Win32_ComputerSystemProduct' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          try {
+            $fwCpus = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | ForEach-Object { $_.VirtualizationFirmwareEnabled })
+            if ($fwCpus.Count -gt 0) { $virtFw = ($fwCpus | ForEach-Object { NA $_ }) -join ' / ' }
+          } catch { }
+
+          Emit ''
+          Emit '### CPU 负载采样'
+          Emit ''
+          Emit '```'
+          $cpuLoadDone = $false
+          try {
+            $samples = @(Get-Counter -Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 3 -ErrorAction Stop)
+            $vals = @()
+            foreach ($s in $samples) { foreach ($csamp in @($s.CounterSamples)) { $vals += [math]::Round($csamp.CookedValue, 1) } }
+            if ($vals.Count -gt 0) {
+              Emit ('samples: ' + ($vals -join ' / '))
+              Emit ('mean: ' + [math]::Round(($vals | Measure-Object -Average).Average, 1) + ' %')
+              $cpuLoadDone = $true
+            }
+          } catch { }
+          if (-not $cpuLoadDone) {
+            try {
+              $lp = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | ForEach-Object { $_.LoadPercentage })
+              if ($lp.Count -gt 0) {
+                Emit ('回退 Win32_Processor.LoadPercentage: ' + (($lp | ForEach-Object { NA $_ }) -join ' / '))
+              } else {
+                Emit 'n/a'
+              }
+            } catch { Emit 'n/a' }
+          }
+          Emit '```'
+
+          Emit ''
+          Emit '### 电源计划（powercfg /getactivescheme）'
+          Emit ''
+          Emit '```'
+          try {
+            $schemeLines = @()
+            $schemeOut = & "$env:SystemRoot\System32\powercfg.exe" /getactivescheme 2>$null
+            if ($LASTEXITCODE -eq 0 -and $schemeOut) { $schemeLines = @($schemeOut | Where-Object { $_ }) }
+            if ($schemeLines.Count -gt 0) { Emit ([string[]]$schemeLines) } else { Emit 'n/a' }
+          } catch { Emit ('n/a（' + $_.Exception.Message + '）') }
+          Emit '```'
+
+          Emit ''
+          Emit '### 架构判定结论'
+          Emit ''
+          Emit '| 项 | 值 |'
+          Emit '|---|---|'
+          $pa = "$env:PROCESSOR_ARCHITECTURE"
+          Tbl 'PROCESSOR_ARCHITECTURE' $pa
+          $archConclusion = 'x64'
+          if ($pa -match 'ARM' -or "$env:PROCESSOR_IDENTIFIER" -match 'ARM') { $archConclusion = 'arm64' }
+          try {
+            $ri = [string][System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
+            if ($ri -match 'Arm') { $archConclusion = 'arm64' }
+            Tbl 'RuntimeInformation.ProcessArchitecture' $ri
+          } catch { Tbl 'RuntimeInformation.ProcessArchitecture' 'n/a' }
+          try { Tbl 'RuntimeInformation.OSArchitecture' ([string][System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) } catch { Tbl 'RuntimeInformation.OSArchitecture' 'n/a' }
+          Emit ''
+          Emit ('> **结论**：架构 = ' + $archConclusion + '（PROCESSOR_ARCHITECTURE = ' + (NA $pa) + '）；HypervisorPresent = ' + $hyperVisor + '；VirtualizationFirmwareEnabled = ' + $virtFw)
+
+          # GitHub 的 pwsh 包装器在脚本结束后会执行 `exit $LASTEXITCODE`。
+          # 上面这些探测调用了 dotnet / choco / powershell.exe 等原生程序，最后一个原生命令
+          # 的非零退出码会把整个 step 判成失败 —— 即使所有输出都已成功写入
+          # （实测：05-software.md 已写到 13128 字节、日志正常，step 仍 exit 1）。
+          # 这是「尽力采集」型步骤，缺工具或工具返回非零都属正常，不该判失败。
+          if ($null -ne $LASTEXITCODE) {
+            Write-Host ("最后一个原生命令退出码: {0}（已忽略，探测输出照常写入）" -f $LASTEXITCODE)
+          }
+          exit 0
+      - name: 🪟 Windows 硬件探测 · 02 内存（02-memory.md）
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $PSNativeCommandArgumentPassing = 'Standard'
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'SilentlyContinue'
+          try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+          $P = $env:PROBE_DIR
+          if (-not $P) { $P = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'probe' }
+          if (-not (Test-Path -LiteralPath $P)) { New-Item -ItemType Directory -Path $P -Force | Out-Null }
+          $script:OutFile = Join-Path -Path $P -ChildPath '02-memory.md'
+          function Emit { param([string[]]$Lines) Add-Content -LiteralPath $script:OutFile -Value $Lines -Encoding UTF8 }
+          function NA { param($v) if ($null -eq $v -or "$v" -eq '') { 'n/a' } else { "$v" } }
+          function Tbl { param([string]$k, $v) $s = NA $v; Emit ('| ' + $k + ' | ' + ($s -replace '\|', '/') + ' |') }
+          function H3 { param([string]$t, [string]$c1 = '项', [string]$c2 = '值') Emit ''; Emit ('### ' + $t); Emit ''; Emit ('| ' + $c1 + ' | ' + $c2 + ' |'); Emit '|---|---|' }
+
+          Set-Content -LiteralPath $script:OutFile -Value '## 💾 内存配置' -Encoding UTF8
+
+          try {
+            $osmem = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+            H3 '操作系统视角内存（Win32_OperatingSystem，原始单位 KB）'
+            Tbl 'TotalVisibleMemorySize (KB)' $osmem.TotalVisibleMemorySize
+            Tbl 'TotalVisibleMemorySize (GB)' ([math]::Round($osmem.TotalVisibleMemorySize / 1MB, 2))
+            Tbl 'FreePhysicalMemory (KB)' $osmem.FreePhysicalMemory
+            Tbl 'FreePhysicalMemory (GB)' ([math]::Round($osmem.FreePhysicalMemory / 1MB, 2))
+            Tbl 'TotalVirtualMemorySize (KB)' $osmem.TotalVirtualMemorySize
+            Tbl 'TotalVirtualMemorySize (GB)' ([math]::Round($osmem.TotalVirtualMemorySize / 1MB, 2))
+            Tbl 'FreeVirtualMemory (KB)' $osmem.FreeVirtualMemory
+            Tbl 'FreeVirtualMemory (GB)' ([math]::Round($osmem.FreeVirtualMemory / 1MB, 2))
+            Tbl 'SizeStoredInPagingFiles (KB)' $osmem.SizeStoredInPagingFiles
+            Tbl 'FreeSpaceInPagingFiles (KB)' $osmem.FreeSpaceInPagingFiles
+          } catch {
+            H3 '操作系统视角内存（Win32_OperatingSystem，原始单位 KB）'
+            Tbl 'Win32_OperatingSystem' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          $memTypeMap = @{ 20 = 'DDR'; 21 = 'DDR2'; 24 = 'DDR3'; 26 = 'DDR4'; 34 = 'DDR5' }
+          $ffMap = @{ 8 = 'DIMM'; 12 = 'SODIMM'; 13 = 'SRIMM'; 15 = 'TSOP' }
+
+          H3 '内存条（Win32_PhysicalMemory / SMBIOS，虚拟机可能返回虚拟内存条，如实报告）'
+          try {
+            $mods = @(Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction Stop)
+            if ($mods.Count -eq 0) { Tbl 'Win32_PhysicalMemory' 'n/a（未返回实例）' }
+            $midx = 0
+            foreach ($m in $mods) {
+              $midx++
+              $mp = ''
+              if ($mods.Count -gt 1) { $mp = ('DIMM' + $midx + ' ') }
+              Tbl ($mp + 'BankLabel / DeviceLocator') ((NA $m.BankLabel) + ' / ' + (NA $m.DeviceLocator))
+              $capGb = 'n/a'
+              if ($m.Capacity) { $capGb = [math]::Round($m.Capacity / 1GB, 2) }
+              Tbl ($mp + 'Capacity (bytes / GB)') ((NA $m.Capacity) + ' / ' + $capGb)
+              Tbl ($mp + 'Speed / ConfiguredClockSpeed (MT/s)') ((NA $m.Speed) + ' / ' + (NA $m.ConfiguredClockSpeed))
+              Tbl ($mp + 'Manufacturer') $m.Manufacturer
+              Tbl ($mp + 'PartNumber') $m.PartNumber
+              $mtName = NA $m.MemoryType
+              if ($null -ne $m.MemoryType -and $memTypeMap.ContainsKey([int]$m.MemoryType)) { $mtName = $memTypeMap[[int]$m.MemoryType] }
+              Tbl ($mp + 'MemoryType（解码 / 原始）') ($mtName + ' / ' + (NA $m.MemoryType))
+              $smtName = NA $m.SMBIOSMemoryType
+              if ($null -ne $m.SMBIOSMemoryType -and $memTypeMap.ContainsKey([int]$m.SMBIOSMemoryType)) { $smtName = $memTypeMap[[int]$m.SMBIOSMemoryType] }
+              Tbl ($mp + 'SMBIOSMemoryType（解码 / 原始）') ($smtName + ' / ' + (NA $m.SMBIOSMemoryType))
+              $ffName = NA $m.FormFactor
+              if ($null -ne $m.FormFactor -and $ffMap.ContainsKey([int]$m.FormFactor)) { $ffName = $ffMap[[int]$m.FormFactor] }
+              Tbl ($mp + 'FormFactor（解码 / 原始）') ($ffName + ' / ' + (NA $m.FormFactor))
+              Tbl ($mp + 'DataWidth / TotalWidth (bit)') ((NA $m.DataWidth) + ' / ' + (NA $m.TotalWidth))
+            }
+          } catch {
+            Tbl 'Win32_PhysicalMemory' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          H3 '内存汇总'
+          try {
+            $osm = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+            $totalKb2 = 0
+            $freeKb2 = 0
+            if ($osm.TotalVisibleMemorySize) { $totalKb2 = [double]$osm.TotalVisibleMemorySize }
+            if ($osm.FreePhysicalMemory) { $freeKb2 = [double]$osm.FreePhysicalMemory }
+            if ($totalKb2 -gt 0) {
+              Tbl '物理内存总量 (GB)' ([math]::Round($totalKb2 / 1MB, 2))
+              Tbl '可用物理内存 (GB)' ([math]::Round($freeKb2 / 1MB, 2))
+              Tbl '已用百分比 (%)' ([math]::Round((($totalKb2 - $freeKb2) / $totalKb2) * 100, 1))
+            } else {
+              Tbl '物理内存汇总' 'n/a'
+            }
+            if ($osm.SizeStoredInPagingFiles) { Tbl '页面文件大小 (GB)' ([math]::Round([double]$osm.SizeStoredInPagingFiles / 1MB, 2)) } else { Tbl '页面文件大小 (GB)' 'n/a' }
+            if ($osm.FreeSpaceInPagingFiles) { Tbl '页面文件可用 (GB)' ([math]::Round([double]$osm.FreeSpaceInPagingFiles / 1MB, 2)) } else { Tbl '页面文件可用 (GB)' 'n/a' }
+          } catch {
+            Tbl '内存汇总' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          H3 '页面文件使用（Win32_PageFileUsage）'
+          try {
+            $pfs = @(Get-CimInstance -ClassName Win32_PageFileUsage -ErrorAction Stop)
+            if ($pfs.Count -eq 0) { Tbl 'Win32_PageFileUsage' 'n/a（无页面文件）' }
+            foreach ($pf in $pfs) {
+              Tbl ('页面文件 ' + (NA $pf.Name) + ' · AllocatedBaseSize (MB)') $pf.AllocatedBaseSize
+              Tbl ('页面文件 ' + (NA $pf.Name) + ' · CurrentUsage (MB)') $pf.CurrentUsage
+              Tbl ('页面文件 ' + (NA $pf.Name) + ' · PeakUsage (MB)') $pf.PeakUsage
+            }
+          } catch {
+            Tbl 'Win32_PageFileUsage' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          Emit ''
+          Emit '### 实时可用内存（Get-Counter）'
+          Emit ''
+          Emit '```'
+          $memCounterDone = $false
+          try {
+            $msamp = @(Get-Counter -Counter '\Memory\Available MBytes' -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop)
+            $mvals = @()
+            foreach ($s in $msamp) { foreach ($msampCs in @($s.CounterSamples)) { $mvals += [math]::Round($msampCs.CookedValue, 0) } }
+            if ($mvals.Count -gt 0) {
+              Emit ('Available MBytes: ' + ($mvals -join ' / '))
+              $memCounterDone = $true
+            }
+          } catch { }
+          if (-not $memCounterDone) {
+            try {
+              $osm2 = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+              if ($osm2.FreePhysicalMemory) { Emit ('回退 FreePhysicalMemory: ' + [math]::Round($osm2.FreePhysicalMemory / 1KB, 0) + ' MB') } else { Emit 'n/a' }
+            } catch { Emit 'n/a' }
+          }
+          Emit '```'
+
+          Emit ''
+          Emit '### fsutil behavior query MemoryUsage'
+          Emit ''
+          Emit '```'
+          try {
+            $fsutilOut = & "$env:SystemRoot\System32\fsutil.exe" behavior query MemoryUsage 2>$null
+            $fsutilLines = @()
+            if ($LASTEXITCODE -eq 0 -and $fsutilOut) { $fsutilLines = @($fsutilOut | Where-Object { $_ }) }
+            if ($fsutilLines.Count -gt 0) { Emit ([string[]]$fsutilLines) } else { Emit ('n/a（fsutil 返回码 ' + $LASTEXITCODE + '）') }
+          } catch { Emit ('n/a（' + $_.Exception.Message + '）') }
+          Emit '```'
+
+          # GitHub 的 pwsh 包装器在脚本结束后会执行 `exit $LASTEXITCODE`。
+          # 上面这些探测调用了 dotnet / choco / powershell.exe 等原生程序，最后一个原生命令
+          # 的非零退出码会把整个 step 判成失败 —— 即使所有输出都已成功写入
+          # （实测：05-software.md 已写到 13128 字节、日志正常，step 仍 exit 1）。
+          # 这是「尽力采集」型步骤，缺工具或工具返回非零都属正常，不该判失败。
+          if ($null -ne $LASTEXITCODE) {
+            Write-Host ("最后一个原生命令退出码: {0}（已忽略，探测输出照常写入）" -f $LASTEXITCODE)
+          }
+          exit 0
+      - name: 🪟 Windows 硬件探测 · 03 磁盘（03-disk.md）
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $PSNativeCommandArgumentPassing = 'Standard'
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'SilentlyContinue'
+          try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+          $P = $env:PROBE_DIR
+          if (-not $P) { $P = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'probe' }
+          if (-not (Test-Path -LiteralPath $P)) { New-Item -ItemType Directory -Path $P -Force | Out-Null }
+          $script:OutFile = Join-Path -Path $P -ChildPath '03-disk.md'
+          function Emit { param([string[]]$Lines) Add-Content -LiteralPath $script:OutFile -Value $Lines -Encoding UTF8 }
+          function NA { param($v) if ($null -eq $v -or "$v" -eq '') { 'n/a' } else { "$v" } }
+          function Tbl { param([string]$k, $v) $s = NA $v; Emit ('| ' + $k + ' | ' + ($s -replace '\|', '/') + ' |') }
+          function H3 { param([string]$t, [string]$c1 = '项', [string]$c2 = '值') Emit ''; Emit ('### ' + $t); Emit ''; Emit ('| ' + $c1 + ' | ' + $c2 + ' |'); Emit '|---|---|' }
+
+          Set-Content -LiteralPath $script:OutFile -Value '## 🗄️ 磁盘 / 存储' -Encoding UTF8
+
+          $dtMap = @{ 1 = '未识别'; 2 = '可移动磁盘'; 3 = '本地磁盘'; 4 = '网络驱动器'; 5 = '光盘'; 6 = 'RAM 磁盘' }
+
+          H3 '逻辑磁盘（Win32_LogicalDisk）'
+          try {
+            $lds = @(Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction Stop)
+            if ($lds.Count -eq 0) { Tbl 'Win32_LogicalDisk' 'n/a（未返回实例）' }
+            foreach ($ld in $lds) {
+              $dtName = NA $ld.DriveType
+              if ($null -ne $ld.DriveType -and $dtMap.ContainsKey([int]$ld.DriveType)) { $dtName = $dtMap[[int]$ld.DriveType] }
+              $sizeGiB = 'n/a'
+              if ($ld.Size) { $sizeGiB = [math]::Round($ld.Size / 1GB, 2) }
+              $freeGiB = 'n/a'
+              if ($null -ne $ld.FreeSpace) { $freeGiB = [math]::Round($ld.FreeSpace / 1GB, 2) }
+              $freePct = 'n/a'
+              if ($ld.Size -and $null -ne $ld.FreeSpace -and $ld.Size -gt 0) { $freePct = [math]::Round(($ld.FreeSpace / $ld.Size) * 100, 1) }
+              Tbl ((NA $ld.DeviceID) + ' 卷标') $ld.VolumeName
+              Tbl ((NA $ld.DeviceID) + ' DriveType') $dtName
+              Tbl ((NA $ld.DeviceID) + ' FileSystem') $ld.FileSystem
+              Tbl ((NA $ld.DeviceID) + ' Size (GiB)') $sizeGiB
+              Tbl ((NA $ld.DeviceID) + ' FreeSpace (GiB)') $freeGiB
+              Tbl ((NA $ld.DeviceID) + ' Free (%)') $freePct
+            }
+          } catch {
+            Tbl 'Win32_LogicalDisk' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          H3 '卷（Get-Volume）'
+          try {
+            $vols = @(Get-Volume -ErrorAction Stop | Where-Object { $_.DriveLetter })
+            if ($vols.Count -eq 0) { Tbl 'Get-Volume' 'n/a（未返回带盘符的卷）' }
+            foreach ($v in $vols) {
+              $vsz = 'n/a'
+              if ($v.Size) { $vsz = [math]::Round($v.Size / 1GB, 2) }
+              $vfr = 'n/a'
+              if ($v.SizeRemaining) { $vfr = [math]::Round($v.SizeRemaining / 1GB, 2) }
+              Tbl ('卷 ' + (NA $v.DriveLetter)) ((NA $v.FileSystemLabel) + ' / ' + (NA $v.FileSystem) + ' / ' + (NA $v.DriveType) + ' / ' + (NA $v.HealthStatus) + ' / 总 ' + $vsz + ' GiB / 余 ' + $vfr + ' GiB')
+            }
+          } catch {
+            Tbl 'Get-Volume' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          H3 '物理磁盘（Get-Disk）'
+          try {
+            $disks = @(Get-Disk -ErrorAction Stop)
+            if ($disks.Count -eq 0) { Tbl 'Get-Disk' 'n/a（未返回实例）' }
+            foreach ($d in $disks) {
+              $dsz = 'n/a'
+              if ($d.Size) { $dsz = [math]::Round($d.Size / 1GB, 2) }
+              Tbl ('Disk ' + (NA $d.Number)) ((NA $d.FriendlyName) + ' / ' + (NA $d.BusType) + ' / ' + (NA $d.HealthStatus) + ' / ' + (NA $d.OperationalStatus) + ' / ' + $dsz + ' GiB / ' + (NA $d.PartitionStyle) + ' / IsBoot=' + (NA $d.IsBoot) + ' / IsSystem=' + (NA $d.IsSystem))
+            }
+          } catch {
+            Tbl 'Get-Disk' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          H3 '物理磁盘介质（Get-PhysicalDisk，MediaType 区分 SSD / HDD）'
+          try {
+            $pds = @(Get-PhysicalDisk -ErrorAction Stop)
+            if ($pds.Count -eq 0) { Tbl 'Get-PhysicalDisk' 'n/a（未返回实例）' }
+            foreach ($pd in $pds) {
+              $pdsz = 'n/a'
+              if ($pd.Size) { $pdsz = [math]::Round($pd.Size / 1GB, 2) }
+              Tbl (NA $pd.FriendlyName) ('DeviceId=' + (NA $pd.DeviceId) + ' / MediaType=' + (NA $pd.MediaType) + ' / BusType=' + (NA $pd.BusType) + ' / ' + $pdsz + ' GiB / Health=' + (NA $pd.HealthStatus) + ' / Location=' + (NA $pd.PhysicalLocation) + ' / Adapter=' + (NA $pd.Adapter))
+            }
+          } catch {
+            Tbl 'Get-PhysicalDisk' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          Emit ''
+          Emit '### 存储可靠性计数器（Get-StorageReliabilityCounter，可能为空）'
+          Emit ''
+          Emit '```'
+          try {
+            $src = @(Get-PhysicalDisk -ErrorAction Stop | Get-StorageReliabilityCounter -ErrorAction Stop)
+            if ($src.Count -eq 0) {
+              Emit 'n/a（未返回数据）'
+            } else {
+              foreach ($rc in $src) {
+                Emit ('DeviceId=' + (NA $rc.DeviceId) + ' Temperature=' + (NA $rc.Temperature) + ' Wear=' + (NA $rc.Wear) + ' ReadErrorsTotal=' + (NA $rc.ReadErrorsTotal) + ' WriteErrorsTotal=' + (NA $rc.WriteErrorsTotal) + ' PowerOnHours=' + (NA $rc.PowerOnHours))
+              }
+            }
+          } catch { Emit ('n/a（' + $_.Exception.Message + '）') }
+          Emit '```'
+
+          Emit ''
+          Emit '### 分区摘要（Get-Partition）'
+          Emit ''
+          Emit '```'
+          try {
+            $parts = @(Get-Partition -ErrorAction Stop)
+            if ($parts.Count -eq 0) { Emit 'n/a（未返回实例）' }
+            foreach ($pt in $parts) {
+              $ptsz = 'n/a'
+              if ($pt.Size) { $ptsz = [math]::Round($pt.Size / 1GB, 2) }
+              Emit ('Disk ' + (NA $pt.DiskNumber) + ' Part ' + (NA $pt.PartitionNumber) + ' Letter=' + (NA $pt.DriveLetter) + ' Type=' + (NA $pt.Type) + ' Size=' + $ptsz + ' GiB')
+            }
+          } catch { Emit ('n/a（' + $_.Exception.Message + '）') }
+          Emit '```'
+
+          Emit ''
+          Emit '### NTFS 详细信息（fsutil fsinfo ntfsinfo C:）'
+          Emit ''
+          Emit '```'
+          try {
+            $ntfsOut = & "$env:SystemRoot\System32\fsutil.exe" fsinfo ntfsinfo C: 2>$null
+            $ntfsLines = @()
+            if ($LASTEXITCODE -eq 0 -and $ntfsOut) { $ntfsLines = @($ntfsOut | Where-Object { $_ }) }
+            if ($ntfsLines.Count -gt 0) { Emit ([string[]]$ntfsLines) } else { Emit ('n/a（fsutil 返回码 ' + $LASTEXITCODE + '）') }
+          } catch { Emit ('n/a（' + $_.Exception.Message + '）') }
+          Emit '```'
+          try {
+            $cv = Get-Volume -DriveLetter C -ErrorAction Stop
+            Emit ''
+            Emit ('C: 文件系统判定：' + (NA $cv.FileSystem) + '（' + (NA $cv.FileSystemType) + '）。若为 ReFS，则上方 NTFS 输出不适用。')
+          } catch { }
+
+          Emit ''
+          Emit '### Runner 工作目录所在卷'
+          Emit ''
+          Emit '| 项 | 值 |'
+          Emit '|---|---|'
+          $ws = $env:GITHUB_WORKSPACE
+          if (-not $ws) { $ws = $env:PROBE_DIR }
+          if (-not $ws) { $ws = $PWD.Path }
+          try {
+            Tbl 'GITHUB_WORKSPACE' $ws
+            $qual = (Split-Path -Path $ws -Qualifier -ErrorAction Stop)
+            $wsLetter = $qual.TrimEnd(':', '\')
+            Tbl '所在盘符' $qual
+            try {
+              $wv = Get-Volume -DriveLetter $wsLetter -ErrorAction Stop
+              $wsz2 = 'n/a'
+              if ($wv.Size) { $wsz2 = [math]::Round($wv.Size / 1GB, 2) }
+              $wfr2 = 'n/a'
+              if ($wv.SizeRemaining) { $wfr2 = [math]::Round($wv.SizeRemaining / 1GB, 2) }
+              Tbl '文件系统 (Get-Volume)' $wv.FileSystem
+              Tbl '卷标' $wv.FileSystemLabel
+              Tbl '总容量 (GiB)' $wsz2
+              Tbl '剩余 (GiB)' $wfr2
+            } catch { Tbl 'Get-Volume（工作盘）' 'n/a' }
+            Emit ''
+            Emit ('> 工作目录 ' + $ws + ' 位于卷 ' + $qual + '。')
+          } catch {
+            Tbl 'Runner 工作目录所在卷' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          H3 'PowerShell 驱动器（Get-PSDrive）'
+          try {
+            $psds = @(Get-PSDrive -PSProvider FileSystem -ErrorAction Stop)
+            if ($psds.Count -eq 0) { Tbl 'Get-PSDrive' 'n/a' }
+            foreach ($psd in $psds) {
+              $used = 'n/a'
+              if ($psd.Used) { $used = [math]::Round($psd.Used / 1GB, 2) }
+              $free = 'n/a'
+              if ($psd.Free) { $free = [math]::Round($psd.Free / 1GB, 2) }
+              Tbl ('PSDrive ' + (NA $psd.Name)) ('Root=' + (NA $psd.Root) + ' / 已用 ' + $used + ' GiB / 可用 ' + $free + ' GiB')
+            }
+          } catch {
+            Tbl 'Get-PSDrive' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          H3 '关键结论：挂载点 / 文件系统 / 容量 / 介质 / 总线' '挂载点' '文件系统 / 总容量 / 可用 / 介质 / 总线'
+          try {
+            $lds2 = @(Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction Stop | Where-Object { $_.DriveType -eq 3 })
+            if ($lds2.Count -eq 0) { Tbl '（无本地磁盘）' 'n/a' }
+            foreach ($ld2 in $lds2) {
+              $letter2 = ('' + $ld2.DeviceID).TrimEnd(':')
+              $fsName = NA $ld2.FileSystem
+              $tGiB = 'n/a'
+              if ($ld2.Size) { $tGiB = [math]::Round($ld2.Size / 1GB, 2) }
+              $fGiB = 'n/a'
+              if ($null -ne $ld2.FreeSpace) { $fGiB = [math]::Round($ld2.FreeSpace / 1GB, 2) }
+              $media = 'n/a'
+              $bus = 'n/a'
+              try {
+                $pt2 = Get-Partition -DriveLetter $letter2 -ErrorAction Stop | Select-Object -First 1
+                if ($pt2 -and $null -ne $pt2.DiskNumber) {
+                  $pd2 = Get-PhysicalDisk -ErrorAction Stop | Where-Object { ('' + $_.DeviceId) -eq ('' + $pt2.DiskNumber) } | Select-Object -First 1
+                  if ($pd2) {
+                    $media = (NA $pd2.MediaType)
+                    $bus = (NA $pd2.BusType)
+                  }
+                }
+              } catch { }
+              Tbl (NA $ld2.DeviceID) ($fsName + ' / ' + $tGiB + ' GiB / ' + $fGiB + ' GiB / ' + $media + ' / ' + $bus)
+            }
+          } catch {
+            Tbl '关键结论' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          # GitHub 的 pwsh 包装器在脚本结束后会执行 `exit $LASTEXITCODE`。
+          # 上面这些探测调用了 dotnet / choco / powershell.exe 等原生程序，最后一个原生命令
+          # 的非零退出码会把整个 step 判成失败 —— 即使所有输出都已成功写入
+          # （实测：05-software.md 已写到 13128 字节、日志正常，step 仍 exit 1）。
+          # 这是「尽力采集」型步骤，缺工具或工具返回非零都属正常，不该判失败。
+          if ($null -ne $LASTEXITCODE) {
+            Write-Host ("最后一个原生命令退出码: {0}（已忽略，探测输出照常写入）" -f $LASTEXITCODE)
+          }
+          exit 0
+      - name: 🪟 Windows 硬件探测 · 04 GPU（04-gpu.md）
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $PSNativeCommandArgumentPassing = 'Standard'
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'SilentlyContinue'
+          try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+          $P = $env:PROBE_DIR
+          if (-not $P) { $P = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'probe' }
+          if (-not (Test-Path -LiteralPath $P)) { New-Item -ItemType Directory -Path $P -Force | Out-Null }
+          $script:OutFile = Join-Path -Path $P -ChildPath '04-gpu.md'
+          function Emit { param([string[]]$Lines) Add-Content -LiteralPath $script:OutFile -Value $Lines -Encoding UTF8 }
+          function NA { param($v) if ($null -eq $v -or "$v" -eq '') { 'n/a' } else { "$v" } }
+          function Tbl { param([string]$k, $v) $s = NA $v; Emit ('| ' + $k + ' | ' + ($s -replace '\|', '/') + ' |') }
+          function H3 { param([string]$t, [string]$c1 = '项', [string]$c2 = '值') Emit ''; Emit ('### ' + $t); Emit ''; Emit ('| ' + $c1 + ' | ' + $c2 + ' |'); Emit '|---|---|' }
+
+          Set-Content -LiteralPath $script:OutFile -Value '## 🎮 GPU / 加速器' -Encoding UTF8
+
+          $gpuNames = @()
+          H3 '显卡适配器（Win32_VideoController）'
+          try {
+            $gpus = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+            if ($gpus.Count -eq 0) { Tbl 'Win32_VideoController' 'n/a（未返回实例）' }
+            foreach ($g in $gpus) {
+              $gpuNames += ('' + $g.Name)
+              Tbl ((NA $g.Name) + ' · VideoProcessor') $g.VideoProcessor
+              Tbl ((NA $g.Name) + ' · DriverVersion') $g.DriverVersion
+              Tbl ((NA $g.Name) + ' · DriverDate') $g.DriverDate
+              Tbl ((NA $g.Name) + ' · VideoModeDescription') $g.VideoModeDescription
+              Tbl ((NA $g.Name) + ' · 当前分辨率 / 刷新率') ((NA $g.CurrentHorizontalResolution) + ' x ' + (NA $g.CurrentVerticalResolution) + ' @ ' + (NA $g.CurrentRefreshRate) + ' Hz')
+              Tbl ((NA $g.Name) + ' · AdapterCompatibility') $g.AdapterCompatibility
+              Tbl ((NA $g.Name) + ' · PNPDeviceID') $g.PNPDeviceID
+              Tbl ((NA $g.Name) + ' · AdapterRAM [uint32]') $g.AdapterRAM
+            }
+            Emit ''
+            Emit '> 注意：`AdapterRAM` 为 32 位无符号整数（uint32），显存超过 4 GB 时会回绕溢出，该字段不可信；实际显存见下方注册表 qwMemorySize。'
+          } catch {
+            Tbl 'Win32_VideoController' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          H3 '实际显存（注册表 qwMemorySize，绕过 uint32 溢出）'
+          try {
+            $classRoot = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+            $gpuKeys = @(Get-ChildItem -Path $classRoot -ErrorAction Stop | Where-Object { $_.PSChildName -match '^[0-9]{4}$' })
+            $foundQw = $false
+            foreach ($gk in $gpuKeys) {
+              try {
+                $gp = Get-ItemProperty -Path $gk.PSPath -ErrorAction Stop
+                $qw = $gp.'HardwareInformation.qwMemorySize'
+                if ($null -ne $qw -and "$qw" -ne '') {
+                  $foundQw = $true
+                  Tbl ((NA $gp.DriverDesc) + ' · qwMemorySize (bytes)') $qw
+                  Tbl ((NA $gp.DriverDesc) + ' · qwMemorySize (GiB)') ([math]::Round([double]$qw / 1GB, 2))
+                }
+              } catch { }
+            }
+            if (-not $foundQw) { Tbl 'qwMemorySize' 'n/a（注册表未返回）' }
+          } catch {
+            Tbl 'qwMemorySize' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          H3 '显示类 PnP 设备（Win32_PnPEntity）'
+          try {
+            $pnps = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter "PNPClass='Display'" -ErrorAction Stop)
+            if ($pnps.Count -eq 0) { Tbl 'Win32_PnPEntity' 'n/a（未返回 Display 类设备）' }
+            foreach ($pe in $pnps) {
+              Tbl (NA $pe.Name) ('Status=' + (NA $pe.Status) + ' / Manufacturer=' + (NA $pe.Manufacturer) + ' / DeviceID=' + (NA $pe.DeviceID))
+            }
+          } catch {
+            Tbl 'Win32_PnPEntity' ('n/a（' + $_.Exception.Message + '）')
+          }
+
+          Emit ''
+          Emit '### NVIDIA CLI（nvidia-smi）'
+          Emit ''
+          Emit '```'
+          $smiCmd = $null
+          try { $smiCmd = Get-Command -Name nvidia-smi -ErrorAction Stop } catch { }
+          if ($null -ne $smiCmd) {
+            try {
+              $smiOut = & $smiCmd.Source 2>$null
+              $smiLines = @()
+              if ($LASTEXITCODE -eq 0 -and $smiOut) { $smiLines = @($smiOut | Where-Object { $_ }) }
+              if ($smiLines.Count -gt 0) { Emit ([string[]]$smiLines) } else { Emit ('n/a（nvidia-smi 返回码 ' + $LASTEXITCODE + '）') }
+            } catch { Emit ('n/a（' + $_.Exception.Message + '）') }
+          } else {
+            Emit 'n/a（未检测到 nvidia-smi，GitHub 托管 Windows runner 不含 NVIDIA GPU，符合预期）'
+          }
+          Emit '```'
+
+          H3 'DirectX（注册表）'
+          $dxVer = 'n/a'
+          try {
+            $dxp1 = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\DirectX' -ErrorAction Stop
+            if ($null -ne $dxp1.Version) { $dxVer = ('' + $dxp1.Version) }
+          } catch { }
+          if ($dxVer -eq 'n/a') {
+            try {
+              $dxp2 = @(Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\DirectX\*' -ErrorAction Stop | Where-Object { $null -ne $_.Version })
+              if ($dxp2.Count -gt 0) { $dxVer = ('' + $dxp2[0].Version) }
+            } catch { }
+          }
+          Tbl 'DirectX Version' $dxVer
+
+          Emit ''
+          Emit '### 结论'
+          Emit ''
+          $virtualPattern = 'Basic Display|Generic VGA|Hyper-V|Virtual|VMware|QEMU|GDI|Parallels|VirtIO'
+          $virtGpus = @($gpuNames | Where-Object { $_ -match $virtualPattern })
+          if ($gpuNames.Count -eq 0) {
+            Emit '> **结论**：当前 runner 未检测到任何 GPU 适配器（Win32_VideoController 为空）。'
+            Emit '> GitHub 标准托管 Windows runner 不含 GPU，CUDA / DirectX 计算 / OpenCL 工作负载无法在此评估。'
+          } elseif ($virtGpus.Count -eq $gpuNames.Count) {
+            Emit ('> **结论**：当前 runner 仅检测到虚拟 / 基本显示适配器（' + ($gpuNames -join '、') + '），无 3D 加速能力，不可用于计算。')
+            Emit '> GitHub 标准托管 Windows runner 不含 GPU，CUDA / DirectX 计算 / OpenCL 工作负载无法在此评估。'
+          } else {
+            Emit ('> **结论**：当前 runner 检测到 GPU 适配器：' + ($gpuNames -join '、') + '。')
+            Emit '> 请以 nvidia-smi / 驱动信息进一步确认计算能力（标准托管 runner 通常不含 GPU，若此处列出非虚拟适配器请人工核实）。'
+          }
+
+          # GitHub 的 pwsh 包装器在脚本结束后会执行 `exit $LASTEXITCODE`。
+          # 上面这些探测调用了 dotnet / choco / powershell.exe 等原生程序，最后一个原生命令
+          # 的非零退出码会把整个 step 判成失败 —— 即使所有输出都已成功写入
+          # （实测：05-software.md 已写到 13128 字节、日志正常，step 仍 exit 1）。
+          # 这是「尽力采集」型步骤，缺工具或工具返回非零都属正常，不该判失败。
+          if ($null -ne $LASTEXITCODE) {
+            Write-Host ("最后一个原生命令退出码: {0}（已忽略，探测输出照常写入）" -f $LASTEXITCODE)
+          }
+          exit 0
+
+      - name: 🧰 探测软件环境（工具链版本）
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+
+          OUT="$PROBE_DIR/05-software.md"
+          FREEZE="$PROBE_DIR/pip-freeze.txt"
+          emit() { printf '%s\n' "$@" >> "$OUT"; }
+
+          # macOS 系统自带 bash 3.2，不支持 declare -A，所以用 name:args 列表 + while read 解析
+          # 冒号右边是该工具取版本号用的参数，缺省即 --version
+          TOOLS='
+          python3:--version
+          python:--version
+          pip:--version
+          pip3:--version
+          pipx:--version
+          uv:--version
+          conda:--version
+          mamba:--version
+          poetry:--version
+          node:--version
+          npm:--version
+          npx:--version
+          yarn:--version
+          pnpm:--version
+          bun:--version
+          deno:--version
+          go:version
+          rustc:--version
+          cargo:--version
+          rustup:--version
+          java:-version
+          javac:-version
+          mvn:--version
+          gradle:--version
+          kotlin:-version
+          scala:-version
+          dotnet:--version
+          ruby:--version
+          gem:--version
+          bundle:--version
+          perl:--version
+          php:--version
+          composer:--version
+          R:--version
+          Rscript:--version
+          julia:--version
+          lua:-v
+          swift:--version
+          gcc:--version
+          g++:--version
+          cc:--version
+          clang:--version
+          clang++:--version
+          make:--version
+          cmake:--version
+          ninja:--version
+          autoconf:--version
+          automake:--version
+          libtool:--version
+          pkg-config:--version
+          pkgconf:--version
+          ld:--version
+          objdump:--version
+          nasm:-v
+          bison:--version
+          flex:--version
+          zig:version
+          tcc:-v
+          docker:--version
+          podman:--version
+          nerdctl:--version
+          buildah:--version
+          skopeo:--version
+          kubectl:version --client
+          helm:version
+          kustomize:version
+          kind:--version
+          minikube:version
+          terraform:--version
+          ansible:--version
+          packer:--version
+          aws:--version
+          az:version
+          gcloud:--version
+          oci:--version
+          doctl:version
+          fly:version
+          vercel:--version
+          netlify:version
+          heroku:version
+          sqlite3:--version
+          mysql:--version
+          mysqld:--version
+          psql:--version
+          pg_config:--version
+          redis-cli:--version
+          mongosh:--version
+          mongo:--version
+          clickhouse-client:--version
+          etcdctl:version
+          git:--version
+          gh:--version
+          curl:--version
+          wget:--version
+          jq:--version
+          yq:--version
+          ssh:-V
+          scp:
+          rsync:--version
+          nc:-h
+          nmap:--version
+          openssl:version
+          gpg:--version
+          base64:--version
+          sha256sum:--version
+          tar:--version
+          zip:--version
+          unzip:--version
+          7z:
+          7za:
+          xz:--version
+          zstd:--version
+          pigz:--version
+          pv:--version
+          htop:--version
+          tmux:-V
+          screen:--version
+          tree:--version
+          file:--version
+          lsof:-v
+          strace:-V
+          dtruss:
+          apt:--version
+          apt-get:--version
+          dpkg:--version
+          snap:--version
+          flatpak:--version
+          brew:--version
+          port:version
+          choco:--version
+          scoop:--version
+          winget:--version
+          '
+
+          # macOS 默认没有 timeout(1)，除非装了 coreutils（那样叫 gtimeout）。
+          # 更阴的坑：Git Bash 的 PATH 里有 C:\Windows\System32\timeout.exe，名字一样但完全不是一回事
+          # ——它不接受 "<秒数> <命令>" 这种形式，拿它包装会让每个工具探测都失败（实测 exit code 2）。
+          # 所以必须确认是 GNU coreutils 版本才用。
+          RUNTO=""
+          for cand in timeout gtimeout; do
+            if command -v "$cand" >/dev/null 2>&1; then
+              if "$cand" --version 2>&1 | head -1 | grep -qi 'GNU coreutils'; then
+                RUNTO="$cand 20"
+                break
+              fi
+              echo "注意：$cand 不是 GNU coreutils 版本（$(command -v "$cand")），不能用于包装，已跳过"
+            fi
+          done
+
+          VERSION_OF=""   # 留给后面记录 python/node 等解释器路径
+          FOUND=0
+          TOTAL=0
+
+          emit "## 🧰 软件环境"
+          emit ""
+          emit "### 通用工具链版本"
+          emit ""
+          emit "| 工具 | 版本 | 路径 |"
+          emit "|---|---|---|"
+
+          while IFS= read -r line; do
+            # 去掉行首缩进（YAML 块里的缩进会被原样带进来）
+            line="${line#"${line%%[![:space:]]*}"}"
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+
+            TOTAL=$((TOTAL + 1))
+            name="${line%%:*}"
+            if [ "$name" = "$line" ]; then args="--version"; else args="${line#*:}"; fi
+            [ -z "$args" ] && args="--version"
+
+            path=""
+            path="$(command -v "$name" 2>/dev/null || true)"
+            if [ -z "$path" ]; then
+              emit "| \`$name\` | 未安装 | - |"
+              continue
+            fi
+            FOUND=$((FOUND + 1))
+
+            # shellcheck disable=SC2086  # $RUNTO 故意为空时要能整体消失，不能加引号
+            ver="$($RUNTO "$path" $args 2>&1 | head -1 | tr -d '\r' | cut -c1-120 | tr '|' '/')"
+            # --version 第一行有时是空行或纯符号，抓第一条有字母数字的行更稳
+            if ! printf '%s' "$ver" | grep -q '[A-Za-z0-9]'; then
+              # shellcheck disable=SC2086
+              ver="$($RUNTO "$path" $args 2>&1 | grep -m1 '[A-Za-z0-9]' | tr -d '\r' | cut -c1-120 | tr '|' '/')"
+            fi
+            [ -z "$ver" ] && ver="已安装（无版本输出）"
+            emit "| \`$name\` | \`$ver\` | \`$path\` |"
+
+            case "$name" in
+              python3|python) [ -z "$VERSION_OF" ] && VERSION_OF="$path" ;;
+            esac
+          done <<< "$TOOLS"
+
+          emit ""
+          emit "> 共探测 **$TOTAL** 个工具，其中 **$FOUND** 个已安装。未安装的项是镜像差异，不是故障。"
+          emit "> \`ssh\` / \`nc\` / \`lsof\` / \`tmux\` 的版本要打到 stderr，已用 \`2>&1\` 合并。"
+          emit ""
+
+          emit "### 语言运行时详情"
+          emit ""
+
+          PY="python3"
+          command -v python3 >/dev/null 2>&1 || PY="python"
+          if command -v "$PY" >/dev/null 2>&1; then
+            emit '```text'
+          # 下面这段 heredoc 的 Python 代码与 PYEOF 终止符都必须落在 YAML 块标量的基准缩进
+          # （此处为 4 空格），de-indent 后才正好是脚本第 0 列。多缩进一格，终止符前面就会
+          # 残留空格，heredoc 永不闭合，bash -n 直接报 syntax error。
+          # 但 4 空格也是块标量的下限 —— 顶到第 0 列会被 YAML 当成块标量结束，解析失败。
+          "$PY" - <<'PYEOF' 2>&1 | head -20 || echo "python 详情读取失败"
+          import platform, ssl, sys
+          print("python      :", sys.version.replace("\n", " "))
+          print("executable  :", sys.executable)
+          print("impl        :", platform.python_implementation(), platform.python_build()[0])
+          print("platform    :", platform.platform())
+          print("machine     :", platform.machine(), "| processor:", platform.processor() or "n/a")
+          try:
+              import sqlite3
+              print("sqlite      :", sqlite3.sqlite_version)
+          except Exception as e:
+              print("sqlite      : n/a (%s)" % e)
+          print("openssl     :", ssl.OPENSSL_VERSION)
+          print("default enc :", sys.getdefaultencoding(), "| fs enc:", sys.getfilesystemencoding())
+          print("switch ivl  :", sys.getswitchinterval())
+          PYEOF
+            emit '```'
+          else
+            emit "- Python：未安装（无法采集运行时详情）"
+          fi
+
+          if command -v node >/dev/null 2>&1; then
+            emit '```text'
+            node -e 'console.log("node        :", process.version);
+            console.log("arch/platform:", process.arch, process.platform);
+            console.log("execPath    :", process.execPath);
+            console.log("v8          :", process.versions.v8);
+            console.log("openssl     :", process.versions.openssl);
+            console.log("uv          :", process.versions.uv);
+            console.log("modules ABI :", process.versions.modules);' 2>&1 | head -10 || echo "node 详情读取失败"
+            emit '```'
+          fi
+
+          for pair in "go:env GOOS GOARCH GOVERSION CGO_ENABLED" "rustc:-vV"; do
+            cmd="${pair%%:*}"; sub="${pair#*:}"
+            if command -v "$cmd" >/dev/null 2>&1; then
+              emit '```text'
+              # shellcheck disable=SC2086
+              $RUNTO "$cmd" $sub 2>&1 | head -12 || echo "$cmd 详情读取失败"
+              emit '```'
+            fi
+          done
+
+          if command -v java >/dev/null 2>&1; then
+            emit '```text'
+            # java 的属性要打到 stderr
+            $RUNTO java -XshowSettings:properties -version 2>&1 | grep -E 'java\.(version|vendor|home)|os\.(arch|name|version)' | head -10 || echo "java 详情读取失败"
+            emit '```'
+          fi
+
+          if command -v dotnet >/dev/null 2>&1; then
+            emit '```text'
+            $RUNTO dotnet --info 2>&1 | head -40 || echo "dotnet --info 失败"
+            emit '```'
+          fi
+
+          emit ""
+          emit "### Python 已安装包"
+          emit ""
+          if command -v "$PY" >/dev/null 2>&1; then
+            if $PY -m pip freeze > "$FREEZE" 2>/dev/null; then
+              CNT=$(grep -c . "$FREEZE" 2>/dev/null || echo 0)
+              emit "- 已安装包总数：**$CNT**"
+              emit "- site-packages：\`$("$PY" -c 'import site,sys;print(site.getsitepackages()[0] if site.getsitepackages() else sys.prefix)' 2>/dev/null || echo n/a)\`"
+              emit "- 完整清单已存为 artifact 里的 \`pip-freeze.txt\`；前 30 行如下："
+              emit ""
+              emit '```text'
+              head -30 "$FREEZE" >> "$OUT"
+              emit '```'
+            else
+              emit "- \`pip freeze\` 执行失败或 pip 不可用"
+            fi
+          else
+            emit "- Python 未安装"
+          fi
+
+          emit ""
+          emit "### 包管理器状态"
+          emit ""
+          case "$RUNNER_OS" in
+            Linux)
+              count_of() { c="$($RUNTO $1 2>/dev/null | grep -c . || true)"; echo "${c:-0}"; }
+              if command -v apt-get >/dev/null 2>&1; then
+                emit "- \`apt\` 已安装 deb 包：$(count_of "dpkg -l") 个（dpkg -l 条目数，含表头）"
+              else
+                emit "- \`apt/dpkg\`：未安装（非 Debian 系镜像）"
+              fi
+              command -v snap >/dev/null 2>&1 \
+                && emit "- \`snap\`：$(count_of "snap list") 个" || emit "- \`snap\`：未安装"
+              command -v flatpak >/dev/null 2>&1 \
+                && emit "- \`flatpak\`：$(count_of "flatpak list") 个" || emit "- \`flatpak\`：未安装"
+              ;;
+            macOS)
+              if command -v brew >/dev/null 2>&1; then
+                emit "- \`brew\`：$(brew --version 2>/dev/null | head -1)"
+                emit "- formula：$(brew list --formula 2>/dev/null | grep -c . || echo 0) 个"
+                emit "- cask：$(brew list --cask 2>/dev/null | grep -c . || echo 0) 个"
+                emit "- 前缀：\`$(brew --prefix 2>/dev/null || echo n/a)\`（Apple Silicon 通常是 /opt/homebrew）"
+              else
+                emit "- \`brew\`：未安装"
+              fi
+              command -v port >/dev/null 2>&1 && emit "- \`macports\`：已安装" || emit "- \`macports\`：未安装"
+              command -v xcodebuild >/dev/null 2>&1 && { emit "- Xcode：$(xcodebuild -version 2>/dev/null | head -1)"; emit "- SDK：\`$(xcode-select -p 2>/dev/null || echo n/a)\`"; }
+              ;;
+            Windows)
+              if command -v choco >/dev/null 2>&1; then
+                emit "- \`choco\`：$(choco --version 2>/dev/null | head -1)"
+                emit "- 本地包：$(choco list --local-only 2>/dev/null | grep -c . || echo 0) 个（含头尾说明行）"
+              else
+                emit "- \`choco\`：未安装"
+              fi
+              command -v scoop >/dev/null 2>&1 && emit "- \`scoop\`：已安装" || emit "- \`scoop\`：未安装"
+              command -v winget >/dev/null 2>&1 && emit "- \`winget\`：$(winget --version 2>/dev/null | head -1)" || emit "- \`winget\`：未安装"
+              emit ""
+              emit "> Windows 的 MSVC / Visual Studio / Windows SDK 详情见下一节（由 pwsh step 采集）。"
+              ;;
+          esac
+
+          echo "--- 05-software.md ($TOTAL 个工具，$FOUND 个已安装) ---"
+          wc -l "$OUT"
+      - name: 🪟 Windows 专属工具链（MSVC / VS / SDK / .NET）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $PSNativeCommandArgumentPassing = 'Standard'
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'SilentlyContinue'
+          try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
+          $P = $env:PROBE_DIR
+          if (-not $P) { $P = Join-Path ([System.IO.Path]::GetTempPath()) 'probe' }
+          $f = Join-Path $P '05-software.md'
+          function Emit { param([string[]]$L) Add-Content -LiteralPath $f -Value $L -Encoding UTF8 }
+
+          Emit ''; Emit '### Windows 专属工具链'; Emit ''
+
+          # --- Visual Studio / MSVC ---
+          # 年份与产品名都不写死：windows-2025 / windows-2025-vs2026 / windows-11-vs2026-arm
+          # 装的 VS 版本各不相同，一律实扫目录
+          $vsRoots = @('C:\Program Files\Microsoft Visual Studio',
+                       'C:\Program Files (x86)\Microsoft Visual Studio')
+          $msvc = @()
+          foreach ($r in $vsRoots) {
+            if (-not (Test-Path -LiteralPath $r)) { continue }
+            foreach ($yr in @(Get-ChildItem -LiteralPath $r -Directory -ErrorAction SilentlyContinue)) {
+              foreach ($prod in @(Get-ChildItem -LiteralPath $yr.FullName -Directory -ErrorAction SilentlyContinue)) {
+                $toolset = Join-Path $prod.FullName 'VC\Tools\MSVC'
+                if (-not (Test-Path -LiteralPath $toolset)) { continue }
+                foreach ($tv in @(Get-ChildItem -LiteralPath $toolset -Directory -ErrorAction SilentlyContinue)) {
+                  $msvc += [pscustomobject]@{ VS = $yr.Name; Product = $prod.Name; MSVC = $tv.Name }
+                }
+              }
+            }
+          }
+          if ($msvc.Count -gt 0) {
+            Emit '| VS | 产品 | MSVC 工具集 |'
+            Emit '|---|---|---|'
+            $msvc | Sort-Object VS, Product, MSVC -Unique | ForEach-Object {
+              Emit ('| ' + $_.VS + ' | ' + $_.Product + ' | ' + $_.MSVC + ' |')
+            }
+          } else {
+            Emit '- MSVC 工具集：未在默认路径找到（如实报告，不推测版本号）'
+          }
+
+          $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+          Emit ('- `cl.exe` 在 PATH 中：' + $(if ($cl) { '是 → `' + $cl.Source + '`' } else { '否（需先执行 vcvars64.bat 才会进 PATH，属正常现象）' }))
+          foreach ($v in 'VSINSTALLDIR','VCINSTALLDIR','VS170COMNTOOLS','VCINSTALLDIR_VS') {
+            $val = [Environment]::GetEnvironmentVariable($v)
+            if ($val) { Emit ('- `' + $v + '` = `' + $val + '`') }
+          }
+
+          # --- Windows SDK ---
+          $sdkRoots = @('C:\Program Files (x86)\Windows Kits\10\Include',
+                        'C:\Program Files\Windows Kits\10\Include')
+          $sdkShown = $false
+          foreach ($sr in $sdkRoots) {
+            if (Test-Path -LiteralPath $sr) {
+              $sdkShown = $true
+              $vers = @(Get-ChildItem -LiteralPath $sr -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+              Emit ('- Windows SDK 版本（' + $sr + '）：' + $(if ($vers.Count) { ($vers -join ', ') } else { '空目录' }))
+            }
+          }
+          if (-not $sdkShown) { Emit '- Windows SDK：未在默认路径找到' }
+
+          # --- .NET ---
+          $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+          if ($dotnet) {
+            Emit ''; Emit '```text'
+            foreach ($sub in @('--list-sdks', '--list-runtimes')) {
+              Emit ('# dotnet ' + $sub)
+              try { Emit (& dotnet $sub 2>&1 | Out-String).TrimEnd() } catch { Emit 'ERROR' }
+            }
+            Emit '```'
+          } else { Emit '- `dotnet`：未安装' }
+
+          # --- PowerShell ---
+          # 每个拼接表达式都必须用 () 包住。PowerShell 的命令参数是 argument mode，
+          # `Emit 'a' + $b` 不会做字符串拼接，而是把 'a'、+、$b 当三个独立参数传进去，
+          # Emit 的 [string[]]$Lines 再逐行写出，结果变成三行碎片。
+          # 另外 argument mode 里裸写 [Type]::Prop.Method() 会解析失败
+          # （报 "An expression was expected after '('"），也必须先加括号。
+          Emit ''; Emit ('- PowerShell：' + $PSVersionTable.PSVersion.ToString() + '（Core=' + $PSVersionTable.PSEdition + '）')
+          Emit ('- .NET 运行时：' + [System.Environment]::Version.ToString())
+          Emit ('- 允许的 TLS：' + ([System.Net.ServicePointManager]::SecurityProtocol -join ', '))
+
+          # --- GitHub 预装工具缓存 ---
+          $tc = $env:RUNNER_TOOL_CACHE
+          if ($tc -and (Test-Path -LiteralPath $tc)) {
+            Emit ''; Emit '### RUNNER_TOOL_CACHE 内容（GitHub 预装）'
+            Emit ''; Emit '```text'
+            try {
+              Get-ChildItem -LiteralPath $tc -Depth 1 -ErrorAction SilentlyContinue |
+                Select-Object -First 120 | ForEach-Object {
+                  Emit ($_.FullName.Replace($tc, '') )
+                }
+            } catch { Emit ('ERROR: ' + $_.Exception.Message) }
+            Emit '```'
+          } else { Emit '- RUNNER_TOOL_CACHE：未设置或不存在' }
+
+          # --- choco 本地包 ---
+          if (Get-Command choco -ErrorAction SilentlyContinue) {
+            Emit ''; Emit '```text'; Emit '# choco list --local-only'
+            try { Emit (& choco list --local-only 2>&1 | Select-Object -First 60 | Out-String).TrimEnd() } catch { Emit 'ERROR' }
+            Emit '```'
+          }
+
+          # --- 操作系统身份 ---
+          Emit ''; Emit '### 操作系统身份'
+          Emit ''
+          Emit '| 项 | 值 |'
+          Emit '|---|---|'
+          try {
+            $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+            foreach ($pair in @(
+              @('Caption', $os.Caption),
+              @('Version', $os.Version),
+              @('BuildNumber', $os.BuildNumber),
+              @('OSArchitecture', $os.OSArchitecture),
+              @('ProductType', $os.ProductType),
+              @('InstallationDate', $os.InstallDate)
+            )) {
+              $v = if ($null -eq $pair[1] -or "$($pair[1])" -eq '') { 'n/a' } else { "$($pair[1])" }
+              Emit ('| ' + $pair[0] + ' | ' + ($v -replace '\|', '/') + ' |')
+            }
+          } catch { Emit '| Win32_OperatingSystem | n/a（' + $_.Exception.Message + '） |' }
+
+          Write-Host "=== 05-software.md 已追加 Windows 专属小节 ==="
+          (Get-Item -LiteralPath $f).Length
+
+          # GitHub 的 pwsh 包装器在脚本结束后会执行 `exit $LASTEXITCODE`。
+          # 上面这些探测调用了 dotnet / choco / powershell.exe 等原生程序，最后一个原生命令
+          # 的非零退出码会把整个 step 判成失败 —— 即使所有输出都已成功写入
+          # （实测：05-software.md 已写到 13128 字节、日志正常，step 仍 exit 1）。
+          # 这是「尽力采集」型步骤，缺工具或工具返回非零都属正常，不该判失败。
+          if ($null -ne $LASTEXITCODE) {
+            Write-Host ("最后一个原生命令退出码: {0}（已忽略，探测输出照常写入）" -f $LASTEXITCODE)
+          }
+          exit 0
+      - name: 🏃 探测 Runner / 镜像环境
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+
+          OUT="$PROBE_DIR/06-runner.md"
+          emit() { printf '%s\n' "$@" >> "$OUT"; }
+
+          # 🔴 凭据过滤：白名单前缀 + 名称模式 + 值模式，三重防护。
+          #    GitHub 会往每个 job 注入 GITHUB_TOKEN，一旦漏进 artifact 就等于泄露仓库令牌。
+          #    注意 KEY / AUTH / PAT 这三个词必须按 _ 分段锚定：用裸子串会把 PATH（含 "PAT"）、
+          #    KEYRING、PATCH_DIR 之类的正常变量一起误伤。TOKEN/SECRET 这类不会误伤的才用裸子串。
+          REDACT_NAME='TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|SIGNING|PRIVATE_KEY|(^|_)(KEY|KEYS|AUTH|PAT|PATS|APIKEY|PASSPHRASE)(_|$)'
+          WHITELIST='^(RUNNER_|ACTIONS_|AGENT_|GITHUB_|Image|DEPLOYMENT_|PIP_|NPM_|NODE_|JAVA_|ANT_|GRADLE_|M2_|DOTNET|GOROOT|GOPATH|CARGO_|RUSTUP_|CHROME|EDGE_|GECKO|SELENIUM_|VCPKG_|CONDA|ANDROID_|HOMEBREW|XCODE_|PERF_|LANG$|LC_|PATH$|SHELL$|HOME$|USER$|USERNAME$|PWD$|TMPDIR$|TEMP$|TMP$|OS$|PROCESSOR_|NUMBER_OF_|SystemRoot|COMPUTERNAME|PSModulePath)'
+
+          emit "## 🏃 Runner / 镜像环境"
+          emit ""
+          emit "> 本节只列与 runner / 工具链相关的变量（前缀白名单）。凡是名字里带"
+          emit "> \`TOKEN\` / \`SECRET\` / \`KEY\` / \`PASSWORD\` / \`AUTH\` 的一律抹成 \`<redacted>\`，"
+          emit "> 值里若检出 \`ghp_\` / \`github_pat_\` / \`AKIA\` 等凭据特征也一并抹除。完整环境变量表不输出。"
+          emit ""
+          emit "### Runner 上下文"
+          emit ""
+          emit "| 变量 | 值 |"
+          emit "|---|---|"
+
+          SHOWN=0
+          HIDDEN=0
+          while IFS= read -r kv; do
+            case "$kv" in *=*) ;; *) continue ;; esac
+            k="${kv%%=*}"; v="${kv#*=}"
+            printf '%s' "$k" | grep -qE "$WHITELIST" || continue
+            if printf '%s' "$k" | grep -qiE "$REDACT_NAME"; then
+              v='<redacted>'; HIDDEN=$((HIDDEN + 1))
+            else
+              case "$v" in
+                *ghp_*|*ghs_*|*gho_*|*ghu_*|*github_pat_*|*AKIA*|*xox[baprs]-*)
+                  v='<redacted: 值中检出疑似凭据特征>' ;;
+              esac
+            fi
+            v="${v//|//}"; v="${v//\`/\'}"          # 防止破坏 Markdown 表格与代码格式
+            emit "| \`$k\` | \`${v:0:220}\` |"
+            SHOWN=$((SHOWN + 1))
+          done < <(env | LC_ALL=C sort)
+
+          # GITHUB_TOKEN 一定存在但一定不能被打印，这里显式记一行以便确认它被拦下了
+          emit "| \`GITHUB_TOKEN\` | \`<redacted>\`（始终抹除，仅确认存在） |"
+          emit ""
+          emit "> 白名单命中并输出 **$SHOWN** 项；因名称含敏感字样而抹除值 **$HIDDEN** 项。"
+
+          # RUNNER_ARCH 由 runner 注入（X64 / ARM64），比 uname -m 更权威
+          ARCH="未知"
+          case "${RUNNER_ARCH:-}" in
+            X64)   ARCH="x64 (X64)" ;;
+            ARM64) ARCH="arm64 (ARM64)" ;;
+            *)     ARCH="uname -m = $(uname -m 2>/dev/null || echo n/a)" ;;
+          esac
+          emit ""
+          emit "> **Runner 架构 = $ARCH**（来源：\`RUNNER_ARCH\` = \`${RUNNER_ARCH:-n/a}\`，\`RUNNER_OS\` = \`${RUNNER_OS:-n/a}\`）"
+
+          emit ""
+          emit "### 镜像与工具缓存"
+          emit ""
+          case "$RUNNER_OS" in
+            Linux)
+              emit '```text'
+              [ -r /etc/os-release ] && cat /etc/os-release >> "$OUT" || echo "/etc/os-release 不可读" >> "$OUT"
+              emit '```'
+              emit '```text'
+              uname -a >> "$OUT" 2>&1 || echo "uname 失败" >> "$OUT"
+              [ -r /proc/version ] && cat /proc/version >> "$OUT"
+              command -v lsb_release >/dev/null 2>&1 && lsb_release -a >> "$OUT" 2>&1
+              emit '```'
+              ;;
+            macOS)
+              emit '```text'
+              sw_vers >> "$OUT" 2>&1 || echo "sw_vers 失败" >> "$OUT"
+              uname -a >> "$OUT" 2>&1
+              command -v xcode-select >/dev/null 2>&1 && echo "DeveloperDir: $(xcode-select -p 2>/dev/null)" >> "$OUT"
+              command -v xcodebuild >/dev/null 2>&1 && xcodebuild -version >> "$OUT" 2>&1
+              emit '```'
+              ;;
+            Windows)
+              emit '```text'
+              cmd.exe /c ver >> "$OUT" 2>&1 || echo "cmd.exe ver 失败" >> "$OUT"
+              emit "ImageOS=${ImageOS:-n/a}  ImageVersion=${ImageVersion:-n/a}" >> "$OUT"
+              emit '```'
+              ;;
+          esac
+
+          if [ -n "${RUNNER_TOOL_CACHE:-}" ] && [ -d "$RUNNER_TOOL_CACHE" ]; then
+            emit ""
+            emit "工具缓存 \`$RUNNER_TOOL_CACHE\`（一级 + 版本目录，最多 120 行）："
+            emit '```text'
+            find "$RUNNER_TOOL_CACHE" -mindepth 1 -maxdepth 2 2>/dev/null | LC_ALL=C sort | head -120 >> "$OUT"
+            emit '```'
+            emit ""
+            emit "工具缓存总大小：$(du -sh "$RUNNER_TOOL_CACHE" 2>/dev/null | awk '{print $1}' || echo n/a)"
+          else
+            emit ""
+            emit "- RUNNER_TOOL_CACHE：未设置或不存在"
+          fi
+
+          emit ""
+          emit "### Actions 运行时"
+          emit ""
+          emit "| 项 | 值 |"
+          emit "|---|---|"
+          emit "| \`gh\` | \`$(command -v gh >/dev/null 2>&1 && gh --version 2>&1 | head -1 | tr -d '\r' | cut -c1-80 || echo 未安装)\` |"
+          emit "| \`git\` | \`$(command -v git >/dev/null 2>&1 && git --version 2>&1 | head -1 | tr -d '\r' || echo 未安装)\` |"
+          emit "| \`node\`（Actions 自身依赖） | \`$(command -v node >/dev/null 2>&1 && node -v 2>&1 | tr -d '\r' || echo 未安装)\` |"
+          emit "| \`bash\` | \`$(bash --version 2>&1 | head -1 | tr -d '\r' | cut -c1-80)\` |"
+          emit "| 默认 shell 行为 | Windows runner 默认 pwsh，本 workflow 全部显式声明 shell |"
+          emit ""
+          # 下面这几个 github.* 表达式是安全的：它们是构建元数据，不是凭据，
+          # 而且刻意用它们，好让报告自带可回溯的 run 标识
+          emit "| 事件 | \`${{ github.event_name }}\` |"
+          emit "| workflow | \`${{ github.workflow }}\` |"
+          emit "| ref / sha | \`${{ github.ref }}\` @ \`${{ github.sha }}\` |"
+          emit "| run id / attempt | \`${{ github.run_id }}\` #\`${{ github.run_attempt }}\` |"
+          emit ""
+          emit "git http 相关配置（token 已抹除）："
+          emit '```text'
+          git config --global --get-regexp '^http\.' 2>/dev/null \
+            | sed -E 's#(://[^/]*:)[^@]*@#\1<redacted>@#g; s#(token[=:])[A-Za-z0-9_.-]+#\1<redacted>#gi' >> "$OUT" \
+            || echo "(无 http.* 配置)" >> "$OUT"
+          emit '```'
+
+          emit ""
+          emit "### 网络与出口"
+          emit ""
+          if command -v curl >/dev/null 2>&1; then
+            emit '```text'
+            echo "# curl -sS -o /dev/null -w '...' https://github.com" >> "$OUT"
+            curl -sS -o /dev/null --max-time 25 \
+              -w 'http_code=%{http_code}\ndns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s speed=%{speed_download}B/s\n' \
+              https://github.com >> "$OUT" 2>&1 || echo "curl 到 github.com 失败" >> "$OUT"
+            echo "" >> "$OUT"
+            echo "# codeload.github.com（拉取 action 与源码用）" >> "$OUT"
+            curl -sS -o /dev/null --max-time 15 -w 'http_code=%{http_code} connect=%{time_connect}s\n' \
+              https://codeload.github.com/ >> "$OUT" 2>&1 || echo "codeload 探测失败" >> "$OUT"
+            emit '```'
+            emit ""
+            emit "> 出口 IP 归属地**未探测**：那需要调用第三方服务，且会把 runner IP 写进公开 artifact。"
+          else
+            emit "- \`curl\` 未安装，跳过出口探测"
+          fi
+          case "$RUNNER_OS" in
+            Linux)   emit "- DNS：\`$(getent hosts github.com 2>/dev/null | head -1 | cut -c1-60 || echo n/a)\`" ;;
+            macOS)   emit "- DNS：\`$(dscacheutil -q host -a name github.com 2>/dev/null | grep -m1 ip_address | cut -c1-60 || echo n/a)\`" ;;
+            Windows) emit "- DNS：\`$(nslookup github.com 2>/dev/null | grep -m1 Address | cut -c1-60 || echo n/a)\`" ;;
+          esac
+
+          emit ""
+          emit "### 容器化检测"
+          emit ""
+          ISVM="无法确定（证据不足：没拿到任何明确的虚拟化标识）"
+          VIRT=""
+          CT_V=""
+          VM_V=""
+          case "$RUNNER_OS" in
+            Linux)
+              # ubuntu-slim 是容器、有 15 分钟 job 上限且不支持 DinD；普通 ubuntu-* 是完整 VM。
+              # 必须靠证据区分，不能从标签名猜。
+              # 注意：不带参数的 systemd-detect-virt 在「VM 里再套容器」时优先报 VM 类型，
+              # 返回 none 的含义是"完全没检测到虚拟化"而不是"这是容器"。
+              # 所以判定容器必须显式用 --container，判定 VM 用 --vm。
+              if command -v systemd-detect-virt >/dev/null 2>&1; then
+                VM_V="$(systemd-detect-virt --vm 2>/dev/null | head -1)"
+                CT_V="$(systemd-detect-virt --container 2>/dev/null | head -1)"
+                VIRT="vm=${VM_V:-n/a},container=${CT_V:-n/a}"
+                emit "- \`systemd-detect-virt --vm\` = \`${VM_V:-n/a}\`"
+                emit "- \`systemd-detect-virt --container\` = \`${CT_V:-n/a}\`"
+              else
+                emit "- \`systemd-detect-virt\`：未安装"
+              fi
+              [ -f /.dockerenv ] && VIRT="$VIRT +/.dockerenv" && emit "- 存在 \`/.dockerenv\` → 容器内" || emit "- 无 \`/.dockerenv\`"
+              if [ -r /proc/1/cgroup ]; then
+                # 只用 docker/containerd/kubepods 判容器：原先还带了 \.scope，会把 systemd 自己的
+                # "0::/init.scope" 误判成容器特征，且与下面 ISVM 结论用的模式不一致
+                if grep -qaE 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
+                  VIRT="$VIRT +cgroup"
+                  emit "- /proc/1/cgroup 含容器特征（docker/containerd/kubepods）："
+                else
+                  emit "- /proc/1/cgroup 无容器特征"
+                fi
+                emit '```text'
+                head -5 /proc/1/cgroup >> "$OUT" 2>/dev/null || echo "(不可读)" >> "$OUT"
+                emit '```'
+              fi
+              emit "- PID 1 可执行文件：\`$(readlink -f /proc/1/exe 2>/dev/null || echo n/a)\`"
+              emit "- cgroup CPU 配额：\`$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo n/a)\`"
+              emit "- 内存上限：\`$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo n/a)\`"
+
+              # 容器证据优先于 VM 证据：「VM 里再套容器」时，只有"这是容器"才能解释
+              # job 为什么会缺 sudo、缺 DinD、被 cgroup 限核（ubuntu-slim 就是这种）
+              if [ -f /.dockerenv ]; then
+                ISVM="容器（存在 /.dockerenv）"
+              elif grep -qaE 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
+                ISVM="容器（/proc/1/cgroup 含 docker/containerd/kubepods 路径）"
+              elif [ -n "$CT_V" ] && [ "$CT_V" != "none" ]; then
+                ISVM="容器（systemd-detect-virt --container=${CT_V}）"
+              elif [ -n "$VM_V" ] && [ "$VM_V" != "none" ]; then
+                ISVM="虚拟机（systemd-detect-virt --vm=${VM_V}）"
+              fi
+              ;;
+            macOS)
+              HM="$(sysctl -n hw.model 2>/dev/null || echo '')"
+              emit "- \`hw.model\`：\`${HM:-n/a}\`（VirtualMac* 即 Apple Virtualization Framework 虚拟机）"
+              emit "- \`kern.hv_support\`：\`$(sysctl -n kern.hv_support 2>/dev/null || echo n/a)\`"
+              emit "- GitHub 的 macOS runner 跑在其自有 macOS 云上（非 Azure），arm64 机型不支持嵌套虚拟化"
+              case "$HM" in
+                VirtualMac*|Virtual*) ISVM="虚拟机（hw.model=${HM}）" ;;
+                '')                   ISVM="无法确定（sysctl hw.model 取值失败）" ;;
+                *)                    ISVM="非 VirtualMac 机型（hw.model=${HM}）；GitHub macOS runner 官方为自有云 VM，但此机型字符串未给出虚拟化证据，不下定论" ;;
+              esac
+              ;;
+            Windows)
+              if command -v powershell.exe >/dev/null 2>&1; then
+                HP=$(powershell.exe -NoProfile -NonInteractive -Command \
+                     "try { (Get-CimInstance Win32_ComputerSystem).HypervisorPresent } catch { 'n/a' }" 2>/dev/null | tr -d '\r')
+                emit "- \`HypervisorPresent\`：\`${HP:-n/a}\`"
+                case "$HP" in
+                  True)  ISVM="虚拟机（Win32_ComputerSystem.HypervisorPresent=True）" ;;
+                  False) ISVM="物理机（HypervisorPresent=False）" ;;
+                esac
+              else
+                emit "- 无法调用 powershell.exe"
+              fi
+              ;;
+          esac
+
+          emit ""
+          emit "> **结论：本 job 运行在 $ISVM 中。** GitHub 托管 runner 均为共享物理机上的 VM，"
+          emit "> 唯 \`ubuntu-slim\` 是容器（1 vCPU / 5 GB / job 上限 15 分钟 / 不支持 Docker-in-Docker）。"
+
+          echo "--- 06-runner.md ---"
+          wc -l "$OUT"
+          # 自检：产物里绝不能出现任何疑似凭据
+          if grep -qE 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}' "$PROBE_DIR"/*.md 2>/dev/null; then
+            echo "::error::探测产物中检出疑似凭据，已阻断上传"
+            exit 1
+          fi
+          echo "✅ 凭据自检通过：产物中未发现 token 特征串"
+
+      - name: 🔬 安装原生基准工具（交叉验证用）
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          if [ "$BENCH_NATIVE" = "false" ]; then
+            echo "native_bench=false，跳过原生工具安装"
+            exit 0
+          fi
+
+          OUT="$PROBE_DIR/08-native.md"
+          echo "## 🔬 原生基准工具" > "$OUT"
+          echo "" >> "$OUT"
+          echo "Python 微基准之外，再用各平台原生工具跑一遍同类负载做交叉验证。" >> "$OUT"
+          echo "数字仍由 \`hw_bench.py\` 统一采集并写入上一节，此处只记录工具可用性。" >> "$OUT"
+          echo "" >> "$OUT"
+          echo '```' >> "$OUT"
+
+          case "$RUNNER_OS" in
+            Linux)
+              # ubuntu-slim 是容器，可能没有 sudo
+              if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+                sudo apt-get update -qq >/dev/null 2>&1 || echo "apt-get update 失败（继续）"
+                sudo apt-get install -y -qq sysbench >/dev/null 2>&1 || echo "sysbench 安装失败（继续）"
+              else
+                echo "无 sudo，跳过 sysbench 安装"
+              fi
+              command -v sysbench >/dev/null 2>&1 && sysbench --version >> "$OUT" 2>&1 || echo "sysbench: 未安装" >> "$OUT"
+              ;;
+            macOS)
+              if command -v brew >/dev/null 2>&1; then
+                brew list sysbench >/dev/null 2>&1 || brew install sysbench >/dev/null 2>&1 || echo "brew install sysbench 失败（继续）"
+              else
+                echo "无 brew，跳过 sysbench 安装"
+              fi
+              command -v sysbench >/dev/null 2>&1 && sysbench --version >> "$OUT" 2>&1 || echo "sysbench: 未安装" >> "$OUT"
+              ;;
+            Windows)
+              # 仓库另一个 workflow 也依赖这个路径，windows runner 预装 7-Zip
+              SZ="/c/Program Files/7-Zip/7z.exe"
+              if [ -f "$SZ" ]; then "$SZ" 2>&1 | head -2 >> "$OUT"; else echo "7z: 未在默认路径找到" >> "$OUT"; fi
+              command -v 7z   >/dev/null 2>&1 && 7z   --help 2>&1 | head -2 >> "$OUT" || true
+              ;;
+            *)
+              echo "未知 RUNNER_OS: $RUNNER_OS" >> "$OUT"
+              ;;
+          esac
+
+          echo '```' >> "$OUT"
+          cat "$OUT"
+
+      - name: ⚡ 运行硬件探测与基准测试
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+
+          ARGS=(--seconds "$BENCH_SECONDS" --disk-mb "$BENCH_DISK_MB" --workers "$BENCH_WORKERS"
+                --disk-path "$PROBE_DIR" --json "$PROBE_DIR/bench.json" --md "$PROBE_DIR/07-bench.md")
+
+          [ "$BENCH_NET"     = "false" ] || ARGS+=(--net)
+          [ "$BENCH_NATIVE"  = "false" ] && ARGS+=(--skip-native)
+
+          echo "python scripts/hw_bench.py ${ARGS[*]}"
+          # 基准脚本自身对所有单项失败都做了兜底并返回 0；这里仍允许失败，避免整条流水线红掉拿不到报告
+          python scripts/hw_bench.py "${ARGS[@]}" || {
+            echo "::warning::hw_bench.py 退出码非 0，继续用已产出的分片拼装报告"
+          }
+
+          echo "--- bench.json 顶层键 ---"
+          python - "$PROBE_DIR/bench.json" <<'PY'
+          import json, sys
+          try:
+              d = json.load(open(sys.argv[1], encoding="utf-8"))
+          except Exception as e:
+              print(f"::warning::bench.json 无法解析: {e}")
+              sys.exit(0)
+          for k, v in d.items():
+              n = len(v) if isinstance(v, dict) else "-"
+              print(f"  {k}: {n}")
+          b = d.get("benchmarks", {})
+          for name, val in b.items():
+              if isinstance(val, dict) and "error" in val:
+                  print(f"::warning::基准 {name} 失败: {val['error']}")
+          PY
+
+      - name: 🧾 拼装报告
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          cd "$PROBE_DIR"
+
+          ls -la || true
+
+          REPORT="$PROBE_DIR/report.md"
+          # 分片按 00~08 数字前缀排序拼接；缺失的分片自然跳过
+          cat [0-9][0-9]-*.md > "$REPORT" 2>/dev/null || cat *-*.md > "$REPORT"
+
+          SIZE=$(wc -c < "$REPORT" | xargs)
+          echo "报告已生成: $REPORT ($SIZE bytes)"
+
+          # GitHub Step Summary 上限 1 MiB，超出会截断而不是报错，所以主动裁剪
+          if [ "$SIZE" -gt 1000000 ]; then
+            echo "::warning::报告 $SIZE bytes 超过 Step Summary 1MiB 上限，摘要只取前 1000000 字节"
+            head -c 1000000 "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+            printf '\n\n> ⚠️ 报告过长已截断，完整内容见 artifact `%s`。\n' "probe-$MATRIX_OS" >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "matrix_os=$MATRIX_OS"     >> "$GITHUB_OUTPUT"
+          echo "report_bytes=$SIZE"       >> "$GITHUB_OUTPUT"
+          # 把关键单核分数冒泡到 step output，方便别的 job 直接取用
+          python - "$PROBE_DIR/bench.json" "$GITHUB_OUTPUT" <<'PY' || true
+          import json, sys
+          try:
+              d = json.load(open(sys.argv[1], encoding="utf-8"))
+          except Exception:
+              sys.exit(0)
+          s = (d.get("benchmarks", {}).get("cpu_single", {}) or {}).get("score")
+          if isinstance(s, (int, float)):
+              with open(sys.argv[2], "a", encoding="utf-8") as f:
+                  f.write(f"cpu_single_score={s:.2f}\n")
+          PY
+
+      - name: 📤 上传报告 artifact
+        if: env.UPLOAD_ARTIFACTS != 'false'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: probe-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/probe/report.md
+            ${{ runner.temp }}/probe/bench.json
+            ${{ runner.temp }}/probe/pip-freeze.txt
+            ${{ runner.temp }}/probe/[0-9][0-9]-*.md
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 9
+
+  report:
+    name: "📊 跨平台汇总对比"
+    needs: probe
+    # 平台 job 有失败也要出对比表，否则失败那次运行什么信息都看不到
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 🧾 Checkout（report job 需要仓库里的 scripts/merge_report.py）
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          fetch-depth: 1
+
+      - name: 🐍 Setup Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+
+      - name: 📥 下载全部 probe artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5
+        with:
+          path: reports
+        continue-on-error: true
+
+      - name: 🔍 检查 reports/ 结构（空则生成降级 summary）
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          SUMDIR="${RUNNER_TEMP:-/tmp}/probe-summary"; mkdir -p "$SUMDIR"
+          echo "== reports/ 目录结构 =="
+          if [ -d reports ]; then
+            find reports -maxdepth 3 -type f | sort
+            echo "-- 共 $(find reports -type f | wc -l) 个文件 --"
+          else
+            echo "reports/ 目录不存在（download-artifact 失败或无 artifact）"
+          fi
+          if [ -z "$(find reports -type f -print -quit 2>/dev/null)" ]; then
+            echo "::warning::reports/ 为空——所有 probe job 均失败或未上传 artifact，生成降级 summary"
+            {
+              echo "## 📊 跨平台硬件 / 性能对比"
+              echo ""
+              echo "> ⚠️ **所有 probe job 均未产出 artifact**，无法生成跨平台对比表。"
+              echo "> 请到本次 run 页面查看各平台 probe job 的失败日志（Job 列表中标红的条目）。"
+              echo ""
+              echo "## ⚡ 基准成绩对比"
+              echo ""
+              echo "> 无数据。"
+              echo ""
+              echo "## 🏆 归一化每核性能"
+              echo ""
+              echo "> 数据不足，无法排名。"
+              echo ""
+              echo "## ⚠️ 可比性说明"
+              echo ""
+              echo "> 无数据，无可比性可谈。"
+              echo ""
+              echo "## 🔗 单平台完整报告"
+              echo ""
+              echo "> 无 artifact 可下载。"
+            } > "$SUMDIR/summary.md"
+            echo '{"platforms": {}, "error": "no artifacts: all probe jobs failed or produced nothing"}' > "$SUMDIR/merged.json"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f "${GITHUB_STEP_SUMMARY:-}" ]; then
+              cat "$SUMDIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+      - name: 🧬 合并各平台 bench.json 生成跨平台对比
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          SUMDIR="${RUNNER_TEMP:-/tmp}/probe-summary"; mkdir -p "$SUMDIR"
+          if [ -n "$(find reports \( -name 'bench.json' -o -name 'bench-*.json' \) -print -quit 2>/dev/null)" ]; then
+            python3 scripts/merge_report.py --root reports --out "$SUMDIR/summary.md" --github-summary
+          else
+            echo "::warning::reports/ 下没有任何 bench*.json，沿用上一步生成的降级 summary"
+          fi
+
+      - name: 📤 导出关键指标到 GITHUB_OUTPUT 并打印 summary
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          SUMDIR="${RUNNER_TEMP:-/tmp}/probe-summary"
+          if [ -f "$SUMDIR/merged.json" ]; then
+            python3 - "$SUMDIR/merged.json" >> "${GITHUB_OUTPUT:-/dev/null}" <<'PY'
+          import json, sys
+          try:
+              with open(sys.argv[1], encoding="utf-8") as f:
+                  d = json.load(f)
+          except Exception as e:
+              sys.stderr.write("WARN: 读取 merged.json 失败: %s\n" % e)
+              sys.exit(0)
+          plats = [n for n, p in (d.get("platforms") or {}).items() if p.get("error") is None]
+          print("platforms_count=%d" % len(plats))
+          print("platforms_list=%s" % ",".join(sorted(plats)))
+          champs = (d.get("derived") or {}).get("champions", {}).get("benchmarks", {})
+          best = champs.get("单核综合分 score", "")
+          print("best_single_core=%s" % best)
+          print("best_multi_core=%s" % champs.get("多核综合分 score", ""))
+          PY
+          else
+            echo "::warning::$SUMDIR/merged.json 不存在，跳过 GITHUB_OUTPUT 导出"
+          fi
+          echo ""
+          echo "===== summary.md 全文 ====="
+          if [ -f "$SUMDIR/summary.md" ]; then
+            cat "$SUMDIR/summary.md"
+          else
+            echo "::warning::$SUMDIR/summary.md 不存在"
+          fi
+          echo "===== summary.md 结束 ====="
+
+      - name: 📦 上传合并后的 summary + merged.json
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5
+        with:
+          name: probe-summary
+          path: |
+            ${{ runner.temp }}/probe-summary/summary.md
+            ${{ runner.temp }}/probe-summary/merged.json
+          if-no-files-found: error
+
+      - name: 🏁 总结（summary 含 ❌ 失败平台则标红 exit 1）
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e   # GitHub 给 shell: bash 注入了 -e -o pipefail，探测步骤必须容忍缺工具与非零退出，否则整步会被杀掉
+          SUMDIR="${RUNNER_TEMP:-/tmp}/probe-summary"
+          if [ ! -f "$SUMDIR/summary.md" ]; then
+            echo "::error::$SUMDIR/summary.md 不存在——report job 异常终止"
+            exit 1
+          fi
+          if grep -q '所有 probe job 均未产出 artifact' "$SUMDIR/summary.md"; then
+            echo "::error::所有 probe job 均失败（未产出任何 artifact），请检查 probe 矩阵 job 的日志"
+            exit 1
+          fi
+          if grep -qE '❌ (解析失败|错误|失败)' "$SUMDIR/summary.md"; then
+            echo "::error::跨平台对比中发现失败的 probe 平台（summary.md 中含 ❌ 标记），详见上方表格与 run 页面 Artifacts"
+            grep -nE '❌ (解析失败|错误|失败)' "$SUMDIR/summary.md" | head -10 || true
+            exit 1
+          fi
+          echo "✅ 全部平台 probe 成功，跨平台对比 summary 已写入 GITHUB_STEP_SUMMARY 并上传为 probe-summary artifact。"
+          exit 0
