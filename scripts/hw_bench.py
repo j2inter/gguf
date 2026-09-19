@@ -64,6 +64,22 @@ SIEVE_PRIMES_2M = 148933  # known prime count below 2e6 (result sanity check)
 # sysbench cpu 的质数上界，必须显式传给 sysbench：各平台默认值不一致，
 # 而这个参数直接决定 events/s 的量级（详见 bench_native 里的注释）
 CPU_MAX_PRIME = 10000
+# sysbench cpu 在 CPU_MAX_PRIME=10000 下的物理可行性上界。
+#
+# 为什么要这个守卫：真实 CI 上 macOS 报出 9,508,754 events/s，而 ubuntu 同参数、
+# 同 sysbench 版本（1.0.20）、回显的 "Prime numbers limit" 也都是 10000 —— 差 2590 倍。
+# 这不可能是硬件差异。反推：若事件数约 2.8 万（3 秒 × ~9500/s，与 Linux 实测同量级），
+# 则 sysbench 认为耗时只有 0.003 秒，即它自己的计时错了三个数量级
+# （macOS 上 clock_gettime 的单位处理问题，非本工具可控）。
+#
+# 上界的推导：prime 上界 10000 意味着每个 event 要对 10000 以内的候选数做试除，
+# 即便按 1e9 次基本运算/秒算，单个 event 也不可能低于 ~10 微秒，
+# 因此 events/s 的物理上限在 1e5 量级。实测真实值：EPYC runner 3,672、
+# 本地 2 vCPU 容器 4,464。取 1e5 相对任何真实观测都有 >20x 余量，
+# 同时能拦下 9.5e6 这类明显是计时错误的数字。
+# 这不是"猜测合理性"：它只拒绝超出物理可能的值，被拒时原始行、版本、
+# 回显参数全部保留在 JSON 里，读者可以自己复核。
+SYSBENCH_CPU_MAX_PLAUSIBLE = 1.0e5
 
 
 def _log(msg):
@@ -1019,16 +1035,31 @@ def bench_native(seconds):
             result["sysbench_prime_limit_reported"] = (
                 int(lim.group(1)) if lim else None)
             eps = re.search(r"events per second:\s*([\d.]+)", out)
-            if eps and lim and int(lim.group(1)) == CPU_MAX_PRIME:
-                result["sysbench_cpu_events_per_sec"] = float(eps.group(1))
-            elif eps:
-                result["sysbench_cpu_note"] = (
-                    "已拒采：请求 --cpu-max-prime=%d，但 sysbench 实际生效的是 %s，"
-                    "该平台构建未采纳此选项，events/s 与其他平台不可比。"
-                    "原始输出行：%s" % (
-                        CPU_MAX_PRIME,
-                        lim.group(1) if lim else "未回显",
-                        result.get("sysbench_cpu_raw") or "n/a"))
+            if eps:
+                val = float(eps.group(1))
+                lim_ok = lim is not None and int(lim.group(1)) == CPU_MAX_PRIME
+                # 两道关卡都过才采纳。任一不过都把原始行留在 JSON 里，
+                # 报告里标成"已拒采"而不是发布一个解释不了的数字
+                if lim_ok and val <= SYSBENCH_CPU_MAX_PLAUSIBLE:
+                    result["sysbench_cpu_events_per_sec"] = val
+                else:
+                    why = []
+                    if not lim_ok:
+                        why.append("请求 --cpu-max-prime=%d，但 sysbench 回显的是 %s"
+                                   % (CPU_MAX_PRIME,
+                                      lim.group(1) if lim else "未回显"))
+                    if val > SYSBENCH_CPU_MAX_PLAUSIBLE:
+                        why.append(
+                            "events/s=%.0f 超出 prime 上界 %d 时的物理可行上限 %.0f "
+                            "（真实硬件实测量级为 1e3~1e4），几乎可以确定是 sysbench "
+                            "自身计时错误而非硬件极快" % (val, CPU_MAX_PRIME,
+                                                          SYSBENCH_CPU_MAX_PLAUSIBLE))
+                    result["sysbench_cpu_note"] = (
+                        "已拒采：" + "；".join(why) +
+                        "。原始输出行：%s；sysbench 版本：%s。"
+                        "该平台的 sysbench CPU 指标不可与其他平台比较。"
+                        % (result.get("sysbench_cpu_raw") or "n/a",
+                           result.get("sysbench_version") or "n/a"))
         mem_args = ["sysbench", "--threads=1", "--time=%d" % t, "memory", "run"]
         res = _cmd_output(mem_args, timeout=t + 60)
         if res and res[0] == 0:
