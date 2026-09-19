@@ -61,14 +61,20 @@ ARCH_ALIASES = {
 }
 
 # 可比性说明（固定段落）
+# 其中标了「实测」的几条是按真实 CI 运行结果校正过的，与 GitHub 文档的口径有出入
 COMPARABILITY_NOTES = """\
 - GitHub 托管 runner 是**共享物理机上的 VM**，邻居负载可能造成同一标签两次运行最高 **±30%** 的波动；单次结果只能用于定性比较，重要结论请多次运行取中位数。
 - **公开仓库的标准 runner 分钟数免费无限量**；私有仓库按分钟计费，且 **macOS 费率是 Linux 的 10 倍**（Windows 为 2 倍），跨平台跑全量矩阵前先算成本。
-- `macos-latest` 现为 **M1 arm64、3 vCPU、7 GB RAM**（不是 4 核 16 GB），与 Intel mac runner（`macos-15-intel` / `macos-26-intel`，4 vCPU / 14 GB）**不可直接比较**。
+- `macos-latest` 现为 **M1 arm64、3 vCPU、7 GB RAM**（不是 4 核 16 GB），与 Intel mac runner（`macos-15-intel` / `macos-26-intel`，4 vCPU / 14 GB）**不可直接比较**。实测 M1 runner 可用内存常年只剩 1 GB 上下，跑大内存负载要格外小心。
 - `ubuntu-slim` 是 **1 vCPU 的容器**（非 VM）、5 GB RAM、单 job 上限 **15 分钟**、**不支持 Docker-in-Docker**，多核基准可能因 cgroup 配额而失败或失真。
 - GitHub 标准 runner **不含 GPU**；表中 GPU 行应如实显示"无"。
-- 磁盘顺序读可能命中**页缓存**（runner 上无法 drop cache），`fsync` 写才更接近真实落盘性能；随机 4K IOPS 同理仅供参考。
-- 纯 Python 基准受**解释器版本**影响显著，跨平台对比前必须核对 `Python 版本` 行是否一致；原生工具（sysbench / 7z）结果可作为交叉验证。\
+- ⚠️ **「磁盘总容量」不等于 GitHub 文档里写的 14 GB SSD**。文档那个数是工作区配额；实际 `disk_usage` 看到的是整个底层卷，实测三个平台分别是 **144 GB / 220 GB / 319 GB**。所以 `disk_mb` 的上限并不受 14 GB 硬约束，但请留出余量。
+- ⚠️ **「含 fsync 写入吞吐」在 macOS 上不可与 Linux / Windows 比较**。Darwin 的 `fsync()` 只把数据推到驱动器缓存，真正落盘要 `fcntl(F_FULLFSYNC)`；实测 macOS 3672 MiB/s vs Linux 182 / Windows 247，这个 20 倍差距是语义差异，不是硬件差距。
+- 磁盘顺序读可能命中**页缓存**（runner 上无法 drop cache），实测 Linux 读 21749 MiB/s 就是这么来的；`fsync` 写更接近真实落盘，随机 4K IOPS 同理仅供参考。
+- 纯 Python 基准受**解释器版本**影响显著。`setup-python` 只保证 `3.12` 这个小版本，补丁号仍可能不同（实测 3.12.14 / 3.12.10 / 3.12.10），跨平台对比前请核对 `Python 版本` 行；原生工具（sysbench / 7z）结果可作为不受解释器影响的交叉验证。
+- ⚠️ **「已装 Python 包数」统计的是 `setup-python` 装的干净解释器，不是镜像预装的 Python**。所以实测只有 1 / 9 / 2 个包，远低于镜像自带 Python 的 200+。要盘点镜像自带环境请改看 `05-software.md` 里的包管理器小节。
+- `numpy 内存带宽` 在默认环境是 `n/a`（`setup-python` 的干净解释器没有 numpy），需要该项请先加一步 `pip install numpy`。
+- `sysbench` 用 `--threads=1`（单线程，对照「单核 CPU」）；`7z b` 默认吃满所有线程（多线程，对照「多核 CPU」）。两者量纲与负载模型不同，不要互相换算。\
 """
 
 # ---------------------------------------------------------------------------
@@ -676,7 +682,9 @@ BENCH_ROWS = [
     ("HTTP GET (MiB/s)", "net", "http_get_mibps", "max", fmt_num, "未测试"),
     ("sysbench CPU (events/s)", "native", "sysbench_cpu_events_per_sec", "max", fmt_num, "-"),
     ("sysbench 内存 (MiB/s)", "native", "sysbench_memory_mibs", "max", fmt_num, "-"),
-    ("7z MIPS", "native", "7z_mips", "max", fmt_num, "-"),
+    ("7z MIPS 总分", "native", "7z_mips", "max", fmt_num, "-"),
+    ("7z 压缩 MIPS", "native", "7z_mips_compress", "max", fmt_num, "-"),
+    ("7z 解压 MIPS", "native", "7z_mips_decompress", "max", fmt_num, "-"),
 ]
 
 

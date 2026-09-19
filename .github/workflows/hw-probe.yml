@@ -19,7 +19,7 @@ on:
         required: false
         default: '3'
       disk_mb:
-        description: '磁盘基准测试文件大小 (MB)。受 runner 14GB 磁盘限制'
+        description: '磁盘基准测试文件大小 (MB)。实测 runner 底层卷有 144~320GB，但请留余量'
         required: false
         default: '1024'
       bench_workers:
@@ -147,7 +147,9 @@ jobs:
           (( IN_SECONDS >= 1 && IN_SECONDS <= 60 )) || fail "bench_seconds 需在 1~60，收到 '$IN_SECONDS'"
 
           [[ "$IN_DISK_MB" =~ ^[0-9]+$ ]] || fail "disk_mb 必须是正整数，收到 '$IN_DISK_MB'"
-          (( IN_DISK_MB >= 64 && IN_DISK_MB <= 8192 )) || fail "disk_mb 需在 64~8192（runner 只有 14GB 盘），收到 '$IN_DISK_MB'"
+          # 上限 8192MB：GitHub 文档写 14GB SSD（那是工作区配额），实测底层卷是
+          # 144/220/319 GB。留这个上限纯粹是为了控制单 job 时长与磁盘占用，不是因为装不下
+          (( IN_DISK_MB >= 64 && IN_DISK_MB <= 8192 )) || fail "disk_mb 需在 64~8192，收到 '$IN_DISK_MB'"
 
           [[ "$IN_WORKERS" =~ ^[0-9]+$ ]] || fail "bench_workers 必须是整数（0=全部逻辑核），收到 '$IN_WORKERS'"
           (( IN_WORKERS <= 64 )) || fail "bench_workers 上限 64，收到 '$IN_WORKERS'"

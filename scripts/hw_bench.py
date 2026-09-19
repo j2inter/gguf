@@ -967,33 +967,70 @@ def bench_native(seconds):
         "sysbench_cpu_events_per_sec": None,
         "sysbench_memory_mibs": None,
         "7z_mips": None,
+        "7z_mips_compress": None,
+        "7z_mips_decompress": None,
+        "7z_threads": None,
     }
+    t = max(1, int(seconds))
     if shutil.which("sysbench"):
+        # sysbench 的语法是 `sysbench [options] [testname] [command]`，而且 --time 必须用
+        # `--time=N` 形式。写成 `sysbench cpu --time 3 run`（选项在 testname 之后 + 空格分隔）
+        # 会直接报 "Unrecognized command line argument: run"，实测三个平台全是这个死法，
+        # 结果就是 native 段永远三个 None。
         res = _cmd_output(
-            ["sysbench", "cpu", "--time", str(max(1, int(seconds))), "run"],
-            timeout=int(seconds) + 30)
+            ["sysbench", "--threads=1", "--time=%d" % t, "cpu", "run"],
+            timeout=t + 60)
         if res and res[0] == 0:
             m = re.search(r"events per second:\s*([\d.]+)", res[1])
             if m:
                 result["sysbench_cpu_events_per_sec"] = float(m.group(1))
         res = _cmd_output(
-            ["sysbench", "memory", "--time", str(max(1, int(seconds))), "run"],
-            timeout=int(seconds) + 30)
+            ["sysbench", "--threads=1", "--time=%d" % t, "memory", "run"],
+            timeout=t + 60)
         if res and res[0] == 0:
+            # 形如 "6393.84 MiB transferred (6388.04 MiB/sec)"
             m = re.search(r"([\d.]+)\s*MiB/sec", res[1])
             if m:
                 result["sysbench_memory_mibs"] = float(m.group(1))
+
     exe = None
     for cand in ("7z", "7za"):
         if shutil.which(cand):
             exe = cand
             break
+    if exe is None and platform.system() == "Windows":
+        # GitHub 的 Windows runner 预装了 7-Zip，但 C:\Program Files\7-Zip 不在 PATH 上
+        # （仓库另一个 workflow pip-download-release.yml 用的也是这个绝对路径），
+        # 所以 shutil.which 必然找不到，必须兜底扫绝对路径。
+        for p in (r"C:\Program Files\7-Zip\7z.exe",
+                  r"C:\Program Files (x86)\7-Zip\7z.exe"):
+            if os.path.isfile(p):
+                exe = p
+                break
     if exe:
-        res = _cmd_output([exe, "b"], timeout=300)
+        res = _cmd_output([exe, "b"], timeout=900)
         if res and res[0] == 0:
-            m = re.findall(r"Avr:\s*([\d.]+)\s*MIPS", res[1])
+            out = res[1]
+            mt = re.search(r"#\s*Benchmark threads:\s*(\d+)", out)
+            if mt:
+                result["7z_threads"] = int(mt.group(1))
+            # 7z b 的输出尾部形如（列：Speed KiB/s | Usage % | R/U MIPS | Rating MIPS，
+            # "|" 前是压缩、后是解压）：
+            #   Avr:      4921   100   5131   5120  |      84241   100   7340   7342
+            #   Tot:             100   6235   6231
+            # 原先的正则 r"Avr:\s*([\d.]+)\s*MIPS" 永远匹配不上 —— Avr 行里根本没有
+            # "MIPS" 字面量，表头才有。Tot 行最后一个数才是常被引用的总分。
+            m = re.search(r"^Avr:\s*([\d\s.|]+)$", out, re.M)
             if m:
-                result["7z_mips"] = float(m[-1])
+                nums = re.findall(r"[\d.]+", m.group(1).replace("|", " "))
+                if len(nums) >= 8:
+                    result["7z_mips_compress"] = float(nums[3])
+                    result["7z_mips_decompress"] = float(nums[7])
+            m = re.search(r"^Tot:\s*([\d\s.]+)$", out, re.M)
+            if m:
+                nums = re.findall(r"[\d.]+", m.group(1))
+                if nums:
+                    result["7z_mips"] = float(nums[-1])
     return result
 
 
@@ -1086,6 +1123,12 @@ def render_markdown(report):
         parts.append("")
         parts.append("> 注：读回测试在写入后立即进行，可能命中页缓存"
                      "（非 root 环境无法 drop cache），数值偏乐观。")
+    if platform.system() == "Darwin":
+        parts.append("")
+        parts.append("> ⚠️ **macOS 的 fsync 语义不同**：Darwin 上 `fsync()` 只把数据推到"
+                     "驱动器缓存，并不强制落盘，真正的持久化刷盘需要 `fcntl(F_FULLFSYNC)`。"
+                     "所以上表「写入吞吐（含 fsync）」在 macOS 上会显著高于 Linux / Windows"
+                     "（实测约 20 倍），**不能跨平台直接比较**，只宜在 macOS 内部做纵向对比。")
     parts.append("")
     parts.append("### 磁盘随机 4K")
     parts.append(_table([
@@ -1110,19 +1153,33 @@ def render_markdown(report):
         ]))
         if net.get("error"):
             parts.append("")
-            parts.append("> 注：部分网络步骤失败 — %s" %
+            parts.append("> 注：网络步骤全部失败 — %s" %
                          _fmt_val(net.get("error")))
+        elif net.get("warnings"):
+            parts.append("")
+            parts.append("> 注：部分网络步骤失败（已保留测到的数据）— %s" %
+                         _fmt_val(net.get("warnings")))
     parts.append("")
     parts.append("### 原生工具交叉验证")
     parts.append(_table([
-        ("sysbench cpu events/s", nat and nat.get("sysbench_cpu_events_per_sec"),
-         "events/s"),
-        ("sysbench memory", nat and nat.get("sysbench_memory_mibs"), "MiB/s"),
-        ("7z b", nat and nat.get("7z_mips"), "MIPS"),
+        ("sysbench cpu events/s（单线程）",
+         nat and nat.get("sysbench_cpu_events_per_sec"), "events/s"),
+        ("sysbench memory（单线程）", nat and nat.get("sysbench_memory_mibs"),
+         "MiB/s"),
+        ("7z b 总分（Tot Rating）", nat and nat.get("7z_mips"), "MIPS"),
+        ("7z b 压缩 Rating（Avr）", nat and nat.get("7z_mips_compress"), "MIPS"),
+        ("7z b 解压 Rating（Avr）", nat and nat.get("7z_mips_decompress"), "MIPS"),
+        ("7z b 基准线程数", nat and nat.get("7z_threads"), "个"),
     ]))
     if nat is None:
         parts.append("")
         parts.append("> 注：未执行（传了 --skip-native）。")
+    else:
+        parts.append("")
+        parts.append("> 注：`sysbench` 用 `--threads=1`，与上面的单核基准对齐；"
+                     "`7z b` 默认用满全部线程，是多核负载，应与「多核 CPU」一节对照。"
+                     "工具未安装时对应项为 n/a（Windows 上 7-Zip 装在 "
+                     "`C:\\Program Files\\7-Zip`，不在 PATH，已按绝对路径兜底查找）。")
     parts.append("")
     return "\n".join(parts)
 
