@@ -61,6 +61,9 @@ MIB = 1024 * 1024
 NET_TIMEOUT = 20
 SIEVE_LIMIT = 2_000_000  # fixed by contract
 SIEVE_PRIMES_2M = 148933  # known prime count below 2e6 (result sanity check)
+# sysbench cpu 的质数上界，必须显式传给 sysbench：各平台默认值不一致，
+# 而这个参数直接决定 events/s 的量级（详见 bench_native 里的注释）
+CPU_MAX_PRIME = 10000
 
 
 def _log(msg):
@@ -966,10 +969,15 @@ def bench_native(seconds):
     result = {
         "sysbench_cpu_events_per_sec": None,
         "sysbench_memory_mibs": None,
+        # 下面三个是审计用原始串：跨平台数字出现过 2200 倍的离谱差异，
+        # 把参数和原始输出行一起存下来，才能核对而不是盲信一个浮点数
+        "sysbench_cpu_args": None,
+        "sysbench_cpu_raw": None,
         "7z_mips": None,
         "7z_mips_compress": None,
         "7z_mips_decompress": None,
         "7z_threads": None,
+        "7z_raw_tot": None,
     }
     t = max(1, int(seconds))
     if shutil.which("sysbench"):
@@ -977,16 +985,28 @@ def bench_native(seconds):
         # `--time=N` 形式。写成 `sysbench cpu --time 3 run`（选项在 testname 之后 + 空格分隔）
         # 会直接报 "Unrecognized command line argument: run"，实测三个平台全是这个死法，
         # 结果就是 native 段永远三个 None。
-        res = _cmd_output(
-            ["sysbench", "--threads=1", "--time=%d" % t, "cpu", "run"],
-            timeout=t + 60)
+        #
+        # --cpu-max-prime 必须显式钉住。实测它的默认值在不同发行版/构建之间不一致，
+        # 而这个参数直接决定 events/s 的量级：
+        #     max-prime=100   -> 2,474,937 events/s
+        #     max-prime=1000  ->   118,950 events/s
+        #     max-prime=10000 ->     4,434 events/s
+        # 真实 CI 里 macOS 报出 8,150,296（Linux 同参数是 3,672），差 2200 倍，
+        # 就是因为各平台默认值不同 —— 不钉参数的跨平台数字毫无可比性。
+        cpu_args = ["sysbench", "--threads=1", "--time=%d" % t,
+                    "--cpu-max-prime=%d" % CPU_MAX_PRIME, "cpu", "run"]
+        result["sysbench_cpu_args"] = " ".join(cpu_args[1:])
+        res = _cmd_output(cpu_args, timeout=t + 60)
         if res and res[0] == 0:
+            m = re.search(r"^.*events per second:.*$", res[1], re.M)
+            if m:
+                # 存原始行，让任何人能核对这个数字是怎么来的，而不是只信一个浮点数
+                result["sysbench_cpu_raw"] = m.group(0).strip()[:120]
             m = re.search(r"events per second:\s*([\d.]+)", res[1])
             if m:
                 result["sysbench_cpu_events_per_sec"] = float(m.group(1))
-        res = _cmd_output(
-            ["sysbench", "--threads=1", "--time=%d" % t, "memory", "run"],
-            timeout=t + 60)
+        mem_args = ["sysbench", "--threads=1", "--time=%d" % t, "memory", "run"]
+        res = _cmd_output(mem_args, timeout=t + 60)
         if res and res[0] == 0:
             # 形如 "6393.84 MiB transferred (6388.04 MiB/sec)"
             m = re.search(r"([\d.]+)\s*MiB/sec", res[1])
@@ -1020,15 +1040,21 @@ def bench_native(seconds):
             #   Tot:             100   6235   6231
             # 原先的正则 r"Avr:\s*([\d.]+)\s*MIPS" 永远匹配不上 —— Avr 行里根本没有
             # "MIPS" 字面量，表头才有。Tot 行最后一个数才是常被引用的总分。
-            m = re.search(r"^Avr:\s*([\d\s.|]+)$", out, re.M)
+            # 这里不锚定行尾（$）：实测 macOS 上 7z 版本不同时列数/排版会变，
+            # 锚定行尾会导致 Avr 整行匹配失败（真实 CI 里 macOS 的压缩/解压分项就是 None）。
+            def _nums(line):
+                return re.findall(r"[\d.]+", line.replace("|", " "))
+
+            m = re.search(r"^Avr:.*$", out, re.M)
             if m:
-                nums = re.findall(r"[\d.]+", m.group(1).replace("|", " "))
+                nums = _nums(m.group(0))
                 if len(nums) >= 8:
                     result["7z_mips_compress"] = float(nums[3])
                     result["7z_mips_decompress"] = float(nums[7])
-            m = re.search(r"^Tot:\s*([\d\s.]+)$", out, re.M)
+            m = re.search(r"^Tot:.*$", out, re.M)
             if m:
-                nums = re.findall(r"[\d.]+", m.group(1))
+                result["7z_raw_tot"] = m.group(0).strip()[:120]
+                nums = _nums(m.group(0))
                 if nums:
                     result["7z_mips"] = float(nums[-1])
     return result
@@ -1171,6 +1197,22 @@ def render_markdown(report):
         ("7z b 解压 Rating（Avr）", nat and nat.get("7z_mips_decompress"), "MIPS"),
         ("7z b 基准线程数", nat and nat.get("7z_threads"), "个"),
     ]))
+    if nat is not None:
+        # 把原始行贴出来：sysbench 的 events/s 曾在 macOS 上报出 8150296（Linux 是 3672），
+        # 差 2200 倍。只给浮点数读者根本无从判断是硬件强还是参数不同，所以必须可审计。
+        audit = []
+        if nat.get("sysbench_cpu_args"):
+            audit.append("- sysbench 实际参数：`%s`"
+                         % _fmt_val(nat.get("sysbench_cpu_args")))
+        if nat.get("sysbench_cpu_raw"):
+            audit.append("- sysbench 原始输出行：`%s`"
+                         % _fmt_val(nat.get("sysbench_cpu_raw")))
+        if nat.get("7z_raw_tot"):
+            audit.append("- 7z 原始 Tot 行：`%s`" % _fmt_val(nat.get("7z_raw_tot")))
+        if audit:
+            parts.append("")
+            parts.append("**原始输出（可审计）**")
+            parts.extend(audit)
     if nat is None:
         parts.append("")
         parts.append("> 注：未执行（传了 --skip-native）。")
