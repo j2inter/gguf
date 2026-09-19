@@ -973,11 +973,15 @@ def bench_native(seconds):
         # 把参数和原始输出行一起存下来，才能核对而不是盲信一个浮点数
         "sysbench_cpu_args": None,
         "sysbench_cpu_raw": None,
+        "sysbench_version": None,
+        "sysbench_prime_limit_reported": None,
+        "sysbench_cpu_note": None,
         "7z_mips": None,
         "7z_mips_compress": None,
         "7z_mips_decompress": None,
         "7z_threads": None,
         "7z_raw_tot": None,
+        "7z_raw_avr": None,
     }
     t = max(1, int(seconds))
     if shutil.which("sysbench"):
@@ -996,15 +1000,35 @@ def bench_native(seconds):
         cpu_args = ["sysbench", "--threads=1", "--time=%d" % t,
                     "--cpu-max-prime=%d" % CPU_MAX_PRIME, "cpu", "run"]
         result["sysbench_cpu_args"] = " ".join(cpu_args[1:])
+        vres = _cmd_output(["sysbench", "--version"], timeout=10)
+        if vres and vres[0] == 0:
+            result["sysbench_version"] = _first_line(vres[1], 80)
         res = _cmd_output(cpu_args, timeout=t + 60)
         if res and res[0] == 0:
-            m = re.search(r"^.*events per second:.*$", res[1], re.M)
+            out = res[1]
+            m = re.search(r"^.*events per second:.*$", out, re.M)
             if m:
                 # 存原始行，让任何人能核对这个数字是怎么来的，而不是只信一个浮点数
                 result["sysbench_cpu_raw"] = m.group(0).strip()[:120]
-            m = re.search(r"events per second:\s*([\d.]+)", res[1])
-            if m:
-                result["sysbench_cpu_events_per_sec"] = float(m.group(1))
+            # sysbench 会把它实际采用的质数上界回显在 "Prime numbers limit: N"。
+            # 显式传了 --cpu-max-prime 也照样可能被某些构建忽略：真实 CI 里 macOS 报出
+            # 6,680,116 events/s，而参数串证明 --cpu-max-prime=10000 已经传进去了
+            # （Linux 同参数是 3,659）。这个数量级只可能对应 prime≈20，说明该选项未生效。
+            # 与其发布一个解释不了的数字，不如用回显值校验，对不上就拒绝采纳并记录原因。
+            lim = re.search(r"Prime numbers limit:\s*(\d+)", out)
+            result["sysbench_prime_limit_reported"] = (
+                int(lim.group(1)) if lim else None)
+            eps = re.search(r"events per second:\s*([\d.]+)", out)
+            if eps and lim and int(lim.group(1)) == CPU_MAX_PRIME:
+                result["sysbench_cpu_events_per_sec"] = float(eps.group(1))
+            elif eps:
+                result["sysbench_cpu_note"] = (
+                    "已拒采：请求 --cpu-max-prime=%d，但 sysbench 实际生效的是 %s，"
+                    "该平台构建未采纳此选项，events/s 与其他平台不可比。"
+                    "原始输出行：%s" % (
+                        CPU_MAX_PRIME,
+                        lim.group(1) if lim else "未回显",
+                        result.get("sysbench_cpu_raw") or "n/a"))
         mem_args = ["sysbench", "--threads=1", "--time=%d" % t, "memory", "run"]
         res = _cmd_output(mem_args, timeout=t + 60)
         if res and res[0] == 0:
@@ -1047,6 +1071,9 @@ def bench_native(seconds):
 
             m = re.search(r"^Avr:.*$", out, re.M)
             if m:
+                # 存下整行：macOS 上的 7z 构建排版与 Linux 不同，Avr 行解析不出 8 列，
+                # 与其静默给 None，不如留原始行让人自己看
+                result["7z_raw_avr"] = m.group(0).strip()[:160]
                 nums = _nums(m.group(0))
                 if len(nums) >= 8:
                     result["7z_mips_compress"] = float(nums[3])
@@ -1201,18 +1228,29 @@ def render_markdown(report):
         # 把原始行贴出来：sysbench 的 events/s 曾在 macOS 上报出 8150296（Linux 是 3672），
         # 差 2200 倍。只给浮点数读者根本无从判断是硬件强还是参数不同，所以必须可审计。
         audit = []
+        if nat.get("sysbench_version"):
+            audit.append("- sysbench 版本：`%s`" % _fmt_val(nat.get("sysbench_version")))
         if nat.get("sysbench_cpu_args"):
             audit.append("- sysbench 实际参数：`%s`"
                          % _fmt_val(nat.get("sysbench_cpu_args")))
         if nat.get("sysbench_cpu_raw"):
             audit.append("- sysbench 原始输出行：`%s`"
                          % _fmt_val(nat.get("sysbench_cpu_raw")))
+        if nat.get("sysbench_prime_limit_reported") is not None:
+            audit.append("- sysbench 回显的质数上界：`%s`（请求 `%d`）"
+                         % (_fmt_val(nat.get("sysbench_prime_limit_reported")),
+                            CPU_MAX_PRIME))
+        if nat.get("7z_raw_avr"):
+            audit.append("- 7z 原始 Avr 行：`%s`" % _fmt_val(nat.get("7z_raw_avr")))
         if nat.get("7z_raw_tot"):
             audit.append("- 7z 原始 Tot 行：`%s`" % _fmt_val(nat.get("7z_raw_tot")))
         if audit:
             parts.append("")
             parts.append("**原始输出（可审计）**")
             parts.extend(audit)
+        if nat.get("sysbench_cpu_note"):
+            parts.append("")
+            parts.append("> ⚠️ %s" % _fmt_val(nat.get("sysbench_cpu_note")))
     if nat is None:
         parts.append("")
         parts.append("> 注：未执行（传了 --skip-native）。")

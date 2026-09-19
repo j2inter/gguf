@@ -396,7 +396,9 @@ def error_notes(platforms):
         b = data.get("benchmarks")
         if not isinstance(b, dict):
             continue
-        # 段级失败/降级必须显式冒出来，否则「表里一片 n/a」和「真没测」无法区分
+        # 段级失败/降级必须显式冒出来，否则「表里一片 n/a」和「真没测」无法区分。
+        # *_note 是「测了但结果不可信、已拒采」的说明（例如某平台 sysbench 忽略了
+        # --cpu-max-prime），这类信息比一个 None 重要得多，同样必须冒出来。
         for sec_name, sec in sorted(b.items()):
             if not isinstance(sec, dict):
                 continue
@@ -414,6 +416,14 @@ def error_notes(platforms):
                         esc(trunc(str(sec["warnings"]), 120))
                     )
                 )
+            for k in sorted(sec):
+                if k.endswith("_note") and isinstance(sec[k], str) and sec[k]:
+                    notes.append(
+                        "> ⚠️ **{}** / {}.{}: {}".format(
+                            esc(rec["name"]), esc(sec_name), esc(k),
+                            esc(trunc(sec[k], 160))
+                        )
+                    )
     return notes
 
 
